@@ -1,6 +1,6 @@
-MindLocal 0.2 · Mac 个人版（Apple 芯片）
+明图 MingTu 0.3.0 · Mac 个人版（Apple 芯片）
 
-双击 MindLocal.app 即可使用，无需 Obsidian、Node.js 或账号。
+双击 明图 MingTu.app 即可使用，无需 Obsidian、Node.js 或账号。
 本应用采用本地临时签名，暂未申请 Apple 公证。Windows 和公开发布暂不处理。
 
 常用操作

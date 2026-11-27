@@ -1,6 +1,6 @@
 {
-  "name": "mindlocal",
-  "version": "0.2.0",
+  "name": "mingtu",
+  "version": "0.3.0",
   "main": "main.cjs",
   "private": true,
   "license": "MIT",
@@ -20,5 +20,6 @@
     "katex": "^0.19.1",
     "markdown-it": "^15.0.3"
   },
-  "description": "Local standalone mind map based on gogoga-mindmap"
+  "description": "Local standalone mind map based on gogoga-mindmap",
+  "productName": "明图 MingTu"
 }
