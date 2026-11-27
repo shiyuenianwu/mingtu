@@ -1,8 +1,10 @@
 # 依赖
 node_modules/
 
-# 打包产物
+# 打包产物（只发版本发布，不进源码历史）
 *.app
+*.zip
+*.dmg
 dist/
 out/
 release/
