@@ -1,14 +1,14 @@
-# MindLocal 本地脑图
+# 明图 MingTu 本地脑图
 
-一个可以在 Mac 上双击就用的思维导图应用。不联网、不要账号、不依赖其他软件，所有文件都留在你自己的电脑里。
+明图（MingTu），一个可以在 Mac 上双击就用的思维导图应用。不联网、不要账号、不依赖其他软件，所有文件都留在你自己的电脑里。
 
-![MindLocal 界面](preview.png)
+![明图界面](preview.png)
 
 > **本项目的定位**：这是基于 [gogoga-mindmap](https://github.com/JackWeiGogoga/gogoga-mindmap) 改造的**非官方独立桌面版**，与原作者没有隶属关系。上游是一个很优秀的网页脑图项目，本项目在它基础上加了桌面封装、本地文件管理、多标签、附件与 PDF 阅读等能力。
 
 ## 下载安装
 
-到 [版本发布页](https://github.com/shiyuenianwu/mindlocal/releases) 下载最新的安装包，解压后把 `MindLocal.app` 拖进「应用程序」文件夹即可。
+到 [版本发布页](https://github.com/shiyuenianwu/mingtu/releases) 下载最新的安装包，解压后把 `MindLocal.app` 拖进「应用程序」文件夹即可。
 
 **当前只提供苹果芯片版**（M 系列芯片的 Mac）。视窗芯片的机器暂时没有包。
 
