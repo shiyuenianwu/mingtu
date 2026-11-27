@@ -1,0 +1,1495 @@
+import { diagSettingDefinitions } from "./diag-host";
+import { AbstractInputSuggest, App, Platform, PluginSettingTab, Setting, setIcon, TFile, type SettingDefinition, type SettingDefinitionItem } from "obsidian";
+import type { TaskProgressMode } from "./task-progress";
+import { DEFAULT_REVIEW_PREFS, type ReviewPrefs } from "./review/core/schedule";
+import { STRUCTURES, Structure } from "./layout";
+import { COLOR_NAMES, parseNodeColors } from "./markdown";
+import { MINDMAP_LIST_ICON } from "./icon";
+import { IconPickerModal, storedValue } from "./icon-picker";
+import { displayEmoji, iconIdOf, isEmojiValue } from "./icon-value";
+import { paletteText, t } from "./i18n";
+import { themeIds, themeLabel, type ThemeId } from "./theme";
+import { newCustomThemeId, type CustomTheme } from "./custom-theme";
+import { ConfirmModal, CustomThemeModal, themeFromBase } from "./custom-theme-modal";
+import { THEME_LIST, themeShortLabel, type ThemeName } from "./theme";
+import type MindMapPlugin from "./main";
+import type { RelShape } from "./model";
+import { colorLabel, redrawAllCanvases, refreshAllBars, syncNotesExpandedAll, toolIcon } from "./canvas";
+import { type ColorKind, createPalette, paintColor, THEME_HIGHLIGHT } from "./color-palette";
+import { colorTitle } from "./format-bar";
+import { cleanLayout, MENU_ITEMS, type MenuPlace, placeOf } from "./menu-layout";
+import { type BarItem, EMBED_TOOLBAR_DEFAULT, encodeLayout, isSep, mergeLayout, moveItem, moveTo, nodebarDefault, sameAsDefault, TOOLBAR_DEFAULT } from "./bar-layout";
+
+/** 嵌入的脑图选了「自定义」就用自己那份按钮清单，否则和打开的脑图一样 */
+export function embedToolbarLayout(s: MindMapSettings): BarItem[] {
+  return s.embedToolbar === "custom" ? mergeLayout(s.embedToolbarLayout, EMBED_TOOLBAR_DEFAULT) : mergeLayout(s.toolbarLayout, TOOLBAR_DEFAULT);
+}
+
+const FUNDING_URL = "https://afdian.com/a/jackweigogoga";
+
+export interface MindMapSettings {
+  defaultStructure: Structure;
+  defaultTheme: ThemeId;
+  customThemes: CustomTheme[];
+  /** 深于此级别的标题节点，新建子节点时改用列表 */
+  maxHeadingLevel: number;
+  /** 新文件的列表缩进 */
+  indent: "tab" | "2" | "4";
+  /** 代码块嵌入的最大高度 */
+  codeBlockMaxHeight: number;
+  /** 是否接管 ```mindmap 代码块；关掉就只认 ```gogoga-mindmap，把 mindmap 让给 Markmind 等同名插件 */
+  claimMindmapBlock: boolean;
+  /** .xmind 被别的插件占了的提示已经弹过（只弹一次） */
+  xmindTakenNoticed?: boolean;
+  /** 重新打开 / 切回脑图时恢复上次的视口和选中 */
+  rememberViewport: boolean;
+  /** 备注默认展开显示在节点下面（默认关：点图标弹窗看） */
+  notesExpanded: boolean;
+  /** 展开的备注卡片里显示什么（#31）：全部 / 只显示列表项 / 有序列表 / 无序列表；只管显示，不改文件 */
+  noteCardShow: "all" | "list" | "ordered" | "unordered";
+  /** 清单上一级的节点显示任务完成度（默认关） */
+  taskProgress: TaskProgressMode;
+  /** 完成度放在文字后面还是下面单独一行 */
+  taskProgressPos: "end" | "below";
+  /** 没单独设线形的关联线画成什么样（#53） */
+  relShape: RelShape;
+  /** 按层级着色：关 / 跟随 Obsidian 的 H1～H6 标题颜色 / 自定义六色（中心主题对应第一个） */
+  levelColors: "off" | "headings" | "custom";
+  /** 自定义的层级颜色（逗号隔开）；跟随标题颜色时，主题没给某级标题设颜色就用这里的 */
+  levelPalette: string;
+  /** 按 PDF++ 标注颜色给节点画外框 */
+  pdfBorder: boolean;
+  /** PDF++ 外框的透明度（0 = 原色，越大越淡） */
+  pdfBorderFade: number;
+  /** 节点文字用的字体（#48）：跟随界面字体 / 跟随正文字体 / 自己填的字体名 */
+  mapFont: "interface" | "text" | "custom";
+  mapFontName: string;
+  /** 编辑备注时旁边实时显示渲染效果（分栏预览，默认关） */
+  notePreview: boolean;
+  /** 编辑备注时所见即所得：嵌入 Obsidian 的实时预览编辑器（默认开）；关掉是普通输入框 */
+  noteLiveEdit: boolean;
+  /** 编辑节点文字时，选中一段文字弹出格式栏（默认关） */
+  formatBar: boolean;
+  /** 选中节点时把它平滑移到画布中间（默认关） */
+  centerOnSelect: boolean;
+  /** 编辑时始终藏起格式标记（默认关） */
+  hideSyntax: boolean;
+  /** Markdown 笔记的实时预览里藏起颜色、荧光笔、下划线的 HTML 标签，直接显示效果（默认关） */
+  hideTagsInNotes: boolean;
+  /** Markdown 笔记的实时预览里选中文字浮出格式栏（默认关，只在电脑上） */
+  formatBarInNotes: boolean;
+  /** 脑图笔记的实时预览、阅读视图里，带颜色的节点文字铺一层同色淡底（默认关） */
+  colorsInNotes: boolean;
+  /** 脑图笔记的实时预览里，行尾的 %%…%% 节点标记怎么显示：原样、缩成小圆点、完全隐藏（默认原样） */
+  markersInNotes: "show" | "dot" | "hide";
+  /** 悬停在节点右边缘就能调宽度（默认关） */
+  widthHandleOnHover: boolean;
+  /** 触屏上的折叠按钮：一直显示（默认）/ 只在选中和已折叠时显示 */
+  touchToggles: "always" | "selected";
+  /** 新建的节点自带名字「主题1」，不写字也留着（默认关） */
+  newNodeName: boolean;
+  /** 编辑时开头打「1.」就给这组同级编号（默认开：关着时手打的「1.」写进文件是 `- 1. 文字`，Markdown 里显示不对） */
+  numberByTyping: boolean;
+  /** 勾上的任务（[x]）在脑图里显示删除线（默认关） */
+  strikeDoneTasks: boolean;
+  /** 编辑时粘贴网页地址，自动抓网页标题粘成 [标题](网址)（默认关） */
+  pasteLinkTitle: boolean;
+  /** 删除节点 / 图片后，库里没人再用的图片附件移到回收站（默认关） */
+  cleanAttachments: boolean;
+  /** 复制节点时去掉 %%…%% 标记（默认关） */
+  copyPlain: boolean;
+  /** 常用文字颜色、荧光笔颜色（逗号隔开） */
+  textColors: string;
+  highlightColors: string;
+  /** 展开备注的最大高度（像素，随节点字号缩放） */
+  noteMaxHeight: number;
+  /** 展开备注的最大宽度（像素，随节点字号缩放）；单条拖过大小的不受它限制 */
+  noteMaxWidth: number;
+  /** 备注窗口、展开的备注卡片里文字的字号（像素，默认 13） */
+  noteFontSize: number;
+  /** 图片拖动调整的最大宽度（像素）：文件里写了更宽的也按它显示 */
+  imageMaxWidth: number;
+  /** 没设宽度的图片默认显示多宽（像素，高度最多是它的 3/4；中心主题里是它的 4/3） */
+  imageThumbWidth: number;
+  /** 节点里表格的最大宽度、高度（像素，随节点字号缩放）：超出的在节点里滚动 */
+  tableMaxWidth: number;
+  tableMaxHeight: number;
+  /** 查看备注弹窗的默认尺寸（设置里填，老版本拖出来的也在这）；单条备注拖过的记在文件状态里（state.ts 的 pw/ph），没有就按内容自适应 */
+  notePopoverSize?: { w: number; h: number };
+  /** 嵌入的脑图上次的缩放（#36）：键是「所在笔记|脑图文件#子路径」，最多记 300 个 */
+  embedZoom?: Record<string, number>;
+  /** 脑图视图是否显示大纲面板 */
+  outlineOpen: boolean;
+  /** 大纲面板里的标题换行显示全文（默认一行，放不下就省略） */
+  outlineWrap: boolean;
+  /** 大纲面板的折叠同步到脑图（以前的做法）；默认大纲自己折叠 */
+  outlineFoldSync: boolean;
+  /**
+   * 写进 frontmatter `icon` 属性的值，让文件列表显示图标。
+   * Notebook Navigator、Iconize 等都读这个属性；留空则不写。
+   * 默认是插件自带的 lucide:mindmap-tree；也支持 Lucide 图标名（lucide:network）或 emoji（🧠）。
+   */
+  listIcon: string;
+  /** 工具栏位置：上下为水平条，左右为垂直条 */
+  toolbarPosition: ToolbarPosition;
+  /** 画布左上角显示导图标题（文件名），点一下就能改名（默认关，B 站落尘-书生） */
+  inlineTitle: boolean;
+  /** 选中节点时显示浮动工具栏 */
+  showNodebar: boolean;
+  /** 浮动工具栏、格式栏放在哪：节点（选中的字）上方 / 下方 / 固定在画布顶部 */
+  barPlacement: "above" | "below" | "top";
+  /** 禅模式时一起收起 Obsidian 的侧栏、标签栏、状态栏 */
+  zenHideObsidian: boolean;
+  /** 浮动工具栏、主工具栏的按钮顺序和显示（bar-layout.ts）；空数组 = 默认 */
+  nodebarLayout: string[];
+  toolbarLayout: string[];
+  /** 浮动工具栏里的节点颜色（逗号隔开的颜色名或 #色值） */
+  nodeColors: string;
+  /** 颜色下拉记住的：上次用的文字颜色、荧光笔（色条上那个），三种颜色各自最近使用的（color-palette.ts） */
+  colorMemory: { last: Partial<Record<"text" | "bg" | "node", string>>; recent: Partial<Record<"text" | "bg" | "node", string[]>> };
+  /** 滚轮行为：pan 平移（Cmd/Ctrl+滚轮缩放），zoom 直接缩放（Shift+滚轮平移） */
+  wheelAction: "pan" | "zoom";
+  /** 左键拖空白处：pan 平移（Shift+拖框选），select 框选（右键或中键拖平移，XMind 的习惯） */
+  leftDrag: "pan" | "select";
+  /** 进入编辑节点时：select 全选文字（打字直接替换），end 光标放在末尾 */
+  editCaret: "select" | "end";
+  /** 拆成子节点：原来的文字留着（默认）；关掉时整个节点拆分就由拆出来的几段代替，只拆选中的文字就把选中的那段去掉 */
+  splitKeepOriginal: boolean;
+  /** 多行节点中间的空行留着（默认关：保存时抹掉空行） */
+  keepBlankLines: boolean;
+  /** 保留节点开头结尾的空格（默认关）：文件里写成 &nbsp;，编辑框里是普通空格 */
+  keepEdgeSpaces: boolean;
+  /** 拆成子节点：拆分符号（标点、序号）留在每段里（默认不留） */
+  splitKeepDelims: boolean;
+  /** 自定义拆分方式：每行「名称：符号」 */
+  customSplits: string;
+  /** 点节点、备注里的笔记链接时在哪里打开（⌘ / ⌘⌥ 点照 Obsidian 的习惯，不看这个） */
+  linkOpen: "current" | "tab" | "split";
+  /** 在右侧分屏打开链接后，焦点放到打开的笔记上（默认关：留在脑图上，方便接着加节点） */
+  linkFocusNote: boolean;
+  /** 点链接时，链到的笔记已经在别的标签页、分屏里开着：直接跳到那里（脑图里选中对应节点），不再开一个（默认关） */
+  linkReuseOpen: boolean;
+  /** 从脑图新建的链接笔记放在哪：跟随 Obsidian 的新文件位置 / 脑图所在文件夹 / 脑图旁边和它同名的文件夹 / 指定文件夹 */
+  newNoteFolder: "default" | "map" | "mapSub" | "custom";
+  /** 新建思维导图放在哪：跟随 Obsidian 的新文件位置 / 当前文件所在的文件夹 / 指定文件夹（B 站爆炸的沙雕） */
+  newMapFolder: "default" | "current" | "custom";
+  /** newMapFolder 是 custom 时的文件夹路径 */
+  newMapFolderPath: string;
+  /** newNoteFolder 是 custom 时的文件夹路径 */
+  newNoteFolderPath: string;
+  /** 节点拖到空白处变成自由主题（默认关：拖到空白处是取消） */
+  dragToFloat: boolean;
+  /** 没有记住的视口时打开脑图：fit 适应画布，center 中心主题 100% */
+  openView: "fit" | "center";
+  /** 同一文件的脑图和 Markdown 同时显示时，选中和光标互相跟随（默认关） */
+  syncSplit: boolean;
+  /** 分屏对照（还没分屏、要新分一屏时）脑图放在哪边：右边（默认）/ 左边 */
+  splitMapSide: "right" | "left";
+  /** 分屏联动定位到折叠着的节点时，把它展开（会改文件里的 %%fold%%，默认关） */
+  followExpand: boolean;
+  /** Markdown 跟着脑图折叠：编辑器和阅读视图里对应的节点按脑图的折叠状态折起来（默认关） */
+  foldFollow: boolean;
+  /** 间隔复习的选项（照 Anki 的牌组选项） */
+  review: ReviewPrefs;
+  /** 有到期题的节点右上角标小绿点（默认开） */
+  reviewDueDots: boolean;
+  /** 复习时顶栏显示计时（默认关，Anki 默认也不显示） */
+  reviewTimer: boolean;
+  /** 卡片上方显示题目在脑图里的路径（默认开） */
+  reviewCrumb: boolean;
+  /** 自定义标记（设置里原样存用户填的文字，用时再解析） */
+  customMarkers: string;
+  customMarkersExclusive: boolean;
+  /** 答案标记（背诵模式遮住、复习时当答案），默认 🙈；🙈 一直认 */
+  answerMarker: string;
+  /** 节点右键菜单各项放哪一层：只存和默认不一样的（见 menu-layout.ts） */
+  menuLayout: Record<string, MenuPlace>;
+  /** 切换成脑图时往 frontmatter 写 mindmap: true，以后都用脑图打开；关掉则只换当前显示 */
+  rememberView: boolean;
+  /** 更新后右下角提示「已更新到 x.y.z」，带「查看更新内容」按钮（whatsnew.ts） */
+  whatsNew: boolean;
+  /** 上次提示过 / 看过的版本 */
+  lastSeenVersion?: string;
+  /** 新建脑图用的模板笔记路径；留空用内置的「主题 1/2/3」 */
+  newFileTemplate: string;
+  /** 编辑器里切换笔记时，旁边的脑图跟着显示那篇（默认关） */
+  followActiveNote: boolean;
+  /** 节点间距、节点字号的百分比，100 为主题原样 */
+  spacingScale: number;
+  fontScale: number;
+  /** 中心主题始终用文件名，唯一的一级标题也只当第一级分支（默认关：一级标题就是中心主题） */
+  fileNameAsRoot: boolean;
+  /** 中心主题是一级标题、而且和文件名一样时，在脑图里改中心主题，笔记跟着改名（默认开：新建的图标题和文件名一样） */
+  renameWithRoot: boolean;
+  /** 笔记的脑图只把标题当节点，列表都算标题的备注（代码块里的脑图不受影响） */
+  headingsOnly: boolean;
+  /** 列表项下的备注写成引用块：每行前加 > 写回，读的时候去掉一层（默认关） */
+  quoteListNotes: boolean;
+  /**
+   * 嵌入的脑图的工具栏：full 和打开的脑图一样；custom 按 embedToolbarLayout 摆；
+   * autohide 阅读模式一直不显示，编辑模式鼠标移上去才显示（0.60 以前的 embedToolbarAutoHide 开关迁过来）
+   */
+  embedToolbar: "full" | "custom" | "autohide";
+  /** 笔记里嵌入的脑图上滚动鼠标滚轮：click 先点一下脑图才拿来平移（默认，没点过时滚页面），always 直接平移脑图（原来的） */
+  embedWheel: "click" | "always";
+  /** 嵌入的脑图选「自定义」时显示哪些按钮、什么顺序（空数组 = 默认：只留「打开 / 编辑」） */
+  embedToolbarLayout: string[];
+}
+
+export type ToolbarPosition = "bottom" | "top" | "left" | "right";
+export interface SavedViewport {
+  tx: number;
+  ty: number;
+  k: number;
+  /** 记下时画布的宽高（旧数据没有） */
+  cw?: number;
+  ch?: number;
+  /** 选中节点的路径 */
+  sel: string | null;
+  /** 最后一次记录的时间，超出 50 个时淘汰最旧的 */
+  at: number;
+}
+/** label 用 getter：设置页打开时才查字典，跟随界面语言 */
+export const TOOLBAR_POSITIONS: { id: ToolbarPosition; readonly label: string }[] = [
+  { id: "bottom", get label() { return t("toolbarPos.bottom"); } },
+  { id: "top", get label() { return t("toolbarPos.top"); } },
+  { id: "left", get label() { return t("toolbarPos.left"); } },
+  { id: "right", get label() { return t("toolbarPos.right"); } },
+];
+
+/** 默认三种常用颜色：红、蓝、绿；荧光笔带一点透明，暗色主题下浅色文字也看得清 */
+/** 默认的节点颜色：内置九种，跟着主题和暗色模式变 */
+export const DEFAULT_NODE_COLORS = COLOR_NAMES.join(", ");
+export const DEFAULT_TEXT_COLORS = "#e03e3e, #2f80ed, #27ae60";
+export const DEFAULT_LEVEL_COLORS = "#e03e3e, #d9730d, #dfab01, #0f7b6c, #0b6e99, #6940a5";
+export const DEFAULT_HIGHLIGHT_COLORS = "#ffd43b99, #69db7c99, #ff8fab99";
+
+export const DEFAULT_SETTINGS: MindMapSettings = {
+  defaultStructure: "logic-right",
+  defaultTheme: "snow",
+  maxHeadingLevel: 3,
+  indent: "tab",
+  codeBlockMaxHeight: 600,
+  claimMindmapBlock: true,
+  rememberViewport: true,
+  outlineOpen: false,
+  outlineWrap: false,
+  outlineFoldSync: false,
+  toolbarPosition: "bottom",
+  inlineTitle: false,
+  showNodebar: true,
+  barPlacement: "above",
+  zenHideObsidian: true,
+  nodebarLayout: [],
+  toolbarLayout: [],
+  nodeColors: DEFAULT_NODE_COLORS,
+  colorMemory: { last: {}, recent: {} },
+  wheelAction: "pan",
+  leftDrag: "pan",
+  editCaret: "select",
+  splitKeepOriginal: true,
+  keepBlankLines: false,
+  keepEdgeSpaces: false,
+  splitKeepDelims: false,
+  customSplits: "",
+  linkOpen: "current",
+  linkFocusNote: false,
+  linkReuseOpen: false,
+  newNoteFolder: "default",
+  newNoteFolderPath: "",
+  newMapFolder: "default",
+  newMapFolderPath: "",
+  dragToFloat: false,
+  openView: "fit",
+  syncSplit: false,
+  splitMapSide: "right",
+  followExpand: false,
+  foldFollow: false,
+  review: { ...DEFAULT_REVIEW_PREFS },
+  reviewDueDots: true,
+  reviewTimer: false,
+  reviewCrumb: true,
+  customMarkers: "",
+  customMarkersExclusive: false,
+  answerMarker: "🙈",
+  menuLayout: {},
+  rememberView: true,
+  whatsNew: true,
+  newFileTemplate: "",
+  embedToolbar: "full",
+  embedWheel: "click",
+  embedToolbarLayout: [],
+  fileNameAsRoot: false,
+  renameWithRoot: true,
+  headingsOnly: false,
+  quoteListNotes: false,
+  followActiveNote: false,
+  spacingScale: 100,
+  fontScale: 100,
+  notesExpanded: false,
+  noteCardShow: "all",
+  taskProgress: "off",
+  taskProgressPos: "end",
+  relShape: "curve",
+  levelColors: "off",
+  levelPalette: DEFAULT_LEVEL_COLORS,
+  pdfBorder: false,
+  pdfBorderFade: 30,
+  mapFont: "interface",
+  mapFontName: "",
+  notePreview: false,
+  noteLiveEdit: true,
+  formatBar: false,
+  copyPlain: false,
+  pasteLinkTitle: false,
+  cleanAttachments: false,
+  centerOnSelect: false,
+  hideSyntax: false,
+  hideTagsInNotes: false,
+  formatBarInNotes: false,
+  colorsInNotes: false,
+  markersInNotes: "show",
+  widthHandleOnHover: false,
+  touchToggles: "always",
+  newNodeName: false,
+  numberByTyping: true,
+  strikeDoneTasks: false,
+  textColors: DEFAULT_TEXT_COLORS,
+  highlightColors: DEFAULT_HIGHLIGHT_COLORS,
+  noteMaxHeight: 240,
+  noteMaxWidth: 320,
+  noteFontSize: 13,
+  imageMaxWidth: 800,
+  imageThumbWidth: 240,
+  tableMaxWidth: 640,
+  tableMaxHeight: 480,
+  customThemes: [],
+  listIcon: MINDMAP_LIST_ICON,
+};
+
+export function indentString(s: MindMapSettings["indent"]): string {
+  return s === "tab" ? "\t" : " ".repeat(Number(s));
+}
+
+/**
+ * Obsidian 1.13 起有声明式设置：插件给一份清单，Obsidian 来画，设置项进全局的设置搜索。
+ * 更早的版本没有，就按同一份清单自己逐项画（renderFallback），不维护两份
+ */
+function declarative(): boolean {
+  return "getControlValue" in PluginSettingTab.prototype;
+}
+
+type Key = keyof MindMapSettings;
+/** 下拉框只认字符串，这几项存的是数字 */
+const NUMBER_DROPDOWNS = new Set<string>(["maxHeadingLevel"]);
+
+export class MindMapSettingTab extends PluginSettingTab {
+  constructor(
+    app: App,
+    private plugin: MindMapPlugin,
+  ) {
+    super(app, plugin);
+  }
+
+  display(): void {
+    if (declarative()) {
+      super.display();
+      return;
+    }
+    this.containerEl.empty();
+    renderFallback(this.containerEl, this.getSettingDefinitions(), this);
+  }
+
+  /**
+   * 列表变了（自定义主题增删）之后重画。新版用 update()：重新取清单、刷新搜索、只重画当前这一页，
+   * 人还停在子页面里；display() 会把子页面画空。旧版没有 update()，整页重画
+   */
+  private refresh(): void {
+    const tab = this as unknown as { update?: () => void };
+    if (declarative() && typeof tab.update === "function") tab.update();
+    else this.display();
+  }
+
+  getControlValue(key: string): unknown {
+    const v = (this.plugin.settings as unknown as Record<string, unknown>)[key];
+    return NUMBER_DROPDOWNS.has(key) ? String(v) : v;
+  }
+
+  async setControlValue(key: string, value: unknown): Promise<void> {
+    const settings = this.plugin.settings as unknown as Record<string, unknown>;
+    settings[key] = NUMBER_DROPDOWNS.has(key) ? Number(value) : value;
+    if (key === "rememberViewport" && !value) this.plugin.viewports.clear();
+    await this.plugin.saveSettings();
+    this.afterChange(key as Key, value);
+  }
+
+  /** 改完要立刻生效的设置：重排、重画、挪工具栏…… */
+  private afterChange(key: Key, value: unknown): void {
+    const p = this.plugin;
+    switch (key) {
+      case "fileNameAsRoot":
+      case "headingsOnly":
+      case "quoteListNotes":
+        return p.reloadMaps();
+      case "notesExpanded":
+        return syncNotesExpandedAll();
+      case "noteCardShow":
+      case "taskProgress":
+      case "taskProgressPos":
+      case "relShape":
+      case "levelColors":
+      case "pdfBorder":
+        p.resetNodeDecor();
+        return redrawAllCanvases();
+      case "mapFont":
+      case "mapFontName":
+        return p.applyDisplayScale();
+      case "toolbarPosition":
+        return p.applyToolbarPosition();
+      case "inlineTitle":
+        return p.applyInlineTitle();
+      case "barPlacement":
+        return redrawAllCanvases();
+      case "embedToolbar":
+        p.applyEmbedToolbar();
+        refreshAllBars();
+        // 选不选「自定义」决定这一页下面列不列按钮
+        this.refresh();
+        return;
+      case "outlineWrap":
+      case "touchToggles":
+        return p.applyEmbedToolbar();
+      case "customMarkers":
+      case "customMarkersExclusive":
+      case "answerMarker":
+        return p.applyCustomMarkers();
+      case "syncSplit":
+        return p.updateSplitSyncButtons();
+      case "strikeDoneTasks":
+        return p.applyDisplayScale(false);
+      case "hideTagsInNotes":
+      case "formatBarInNotes":
+      case "colorsInNotes":
+      case "markersInNotes":
+        return p.applyNoteTags();
+      case "reviewDueDots":
+      case "reviewTimer":
+      case "reviewCrumb":
+        p.review?.changed();
+        return;
+      case "foldFollow":
+        if (value) p.syncFolds();
+        return;
+      default:
+        return;
+    }
+  }
+
+  getSettingDefinitions(): SettingDefinitionItem[] {
+    const toggle = (key: Key, name: string, desc: string, aliases?: string[]): SettingDefinition => ({ name, desc, aliases, control: { type: "toggle", key } });
+    const dropdown = (key: Key, name: string, desc: string, options: Record<string, string>, aliases?: string[]): SettingDefinition => ({
+      name,
+      desc,
+      aliases,
+      control: { type: "dropdown", key, options },
+    });
+    const text = (key: Key, name: string, desc: string, placeholder: string, aliases?: string[]): SettingDefinition => ({
+      name,
+      desc,
+      aliases,
+      control: { type: "text", key, placeholder },
+    });
+    const group = (heading: string, items: SettingDefinition[]): SettingDefinitionItem => ({ type: "group", heading, items });
+    /** 子页面：入口页一行一个，desc 说里面有什么；displayValue 让人不点进去也看得到当前状态 */
+    const page = (name: string, desc: string, items: SettingDefinitionItem[], displayValue?: () => string): SettingDefinitionItem => ({
+      type: "page",
+      name,
+      desc,
+      items,
+      displayValue,
+    });
+    const settings = this.plugin.settings;
+
+    return [
+      page(
+        t("settings.group.open"),
+        t("settings.page.open"),
+        [
+          dropdown("openView", t("settings.openView.name"), t("settings.openView.desc"), { fit: t("settings.openView.fit"), center: t("settings.openView.center") }),
+          toggle("rememberViewport", t("settings.rememberViewport.name"), t("settings.rememberViewport.desc")),
+          toggle("rememberView", t("settings.rememberView.name"), t("settings.rememberView.desc")),
+          toggle("whatsNew", t("settings.whatsNew.name"), t("settings.whatsNew.desc"), ["update", "changelog", "更新", "新功能"]),
+          dropdown("touchToggles", t("settings.touchToggles.name"), t("settings.touchToggles.desc"), { always: t("settings.touchToggles.always"), selected: t("settings.touchToggles.selected") }, ["fold", "折叠", "按钮", "touch", "手机", "平板"]),
+          dropdown("defaultStructure", t("settings.structure.name"), t("settings.structure.desc"), Object.fromEntries(STRUCTURES.map((x) => [x.id, x.label])), ["layout", "布局"]),
+          dropdown("defaultTheme", t("settings.theme.name"), t("settings.theme.desc"), Object.fromEntries(themeIds().map((id) => [id, themeLabel(id)])), ["style", "风格", "配色"]),
+          this.scaleSetting("spacingScale", t("settings.spacing.name"), t("settings.spacing.desc"), 50, 200),
+          this.scaleSetting("fontScale", t("settings.fontScale.name"), t("settings.fontScale.desc"), 70, 150),
+          dropdown("mapFont", t("settings.mapFont.name"), t("settings.mapFont.desc"), { interface: t("settings.mapFont.interface"), text: t("settings.mapFont.text"), custom: t("settings.mapFont.custom") }, ["font", "字体", "typeface"]),
+          text("mapFontName", t("settings.mapFontName.name"), t("settings.mapFontName.desc"), "LXGW WenKai", ["font", "字体"]),
+          this.sizeSetting("imageThumbWidth", t("settings.imageThumbWidth.name"), t("settings.imageThumbWidth.desc"), 120, 800, t("settings.resetImageThumb")),
+          this.sizeSetting("imageMaxWidth", t("settings.imageMaxWidth.name"), t("settings.imageMaxWidth.desc"), 400, 2000, t("settings.resetImageMax")),
+          dropdown(
+            "taskProgress",
+            t("settings.taskProgress.name"),
+            t("settings.taskProgress.desc"),
+            { off: t("settings.taskProgress.off"), percent: t("settings.taskProgress.percent"), count: t("settings.taskProgress.count"), both: t("settings.taskProgress.both") },
+            ["task", "todo", "checkbox", "progress", "任务", "清单", "待办", "进度", "完成"],
+          ),
+          dropdown(
+            "taskProgressPos",
+            t("settings.taskProgressPos.name"),
+            t("settings.taskProgressPos.desc"),
+            { end: t("settings.taskProgressPos.end"), below: t("settings.taskProgressPos.below") },
+            ["task", "progress", "任务", "进度", "位置", "下方"],
+          ),
+          dropdown("relShape", t("settings.relShape.name"), t("settings.relShape.desc"), { curve: t("edge.curve"), straight: t("edge.straight"), elbow: t("edge.elbow") }, ["relationship", "关联线", "直线", "line"]),
+          dropdown(
+            "levelColors",
+            t("settings.levelColors.name"),
+            t("settings.levelColors.desc"),
+            { off: t("settings.levelColors.off"), headings: t("settings.levelColors.headings"), custom: t("settings.levelColors.custom") },
+            ["level", "depth", "heading", "层级", "标题颜色", "配色", "着色"],
+          ),
+          this.colorListSetting("levelPalette", "text", t("settings.levelPalette.name"), t("settings.levelPalette.desc"), ["level", "层级", "配色"]),
+          toggle("pdfBorder", t("settings.pdfBorder.name"), t("settings.pdfBorder.desc"), ["pdf", "pdf++", "标注", "外框", "颜色"]),
+          this.sliderWithReset("pdfBorderFade", t("settings.pdfBorderFade.name"), t("settings.pdfBorderFade.desc"), 0, 90, 5, 30, t("settings.reset"), () => {
+            this.plugin.resetNodeDecor();
+            redrawAllCanvases();
+          }),
+        ],
+        () => STRUCTURES.find((x) => x.id === settings.defaultStructure)?.label ?? "",
+      ),
+      page(t("settings.group.edit"), t("settings.page.edit"), [
+        dropdown("editCaret", t("settings.editCaret.name"), t("settings.editCaret.desc"), { select: t("settings.editCaret.select"), end: t("settings.editCaret.end") }, ["cursor", "光标"]),
+        toggle("keepBlankLines", t("settings.keepBlankLines.name"), t("settings.keepBlankLines.desc"), ["blank line", "空行", "换行", "多行"]),
+        toggle("keepEdgeSpaces", t("settings.keepEdgeSpaces.name"), t("settings.keepEdgeSpaces.desc"), ["space", "空格", "nbsp", "缩进", "开头", "结尾"]),
+        toggle("splitKeepOriginal", t("settings.splitKeepOriginal.name"), t("settings.splitKeepOriginal.desc"), ["split", "拆分", "拆成子节点"]),
+        toggle("splitKeepDelims", t("settings.splitKeepDelims.name"), t("settings.splitKeepDelims.desc"), ["split", "拆分", "标点", "序号"]),
+        {
+          name: t("settings.customSplits.name"),
+          desc: t("settings.customSplits.desc"),
+          aliases: ["split", "拆分", "自定义"],
+          render: (setting) => {
+            setting.addTextArea((ta) => {
+              ta.setPlaceholder(t("settings.customSplits.placeholder"))
+                .setValue(this.plugin.settings.customSplits)
+                .onChange(async (v) => {
+                  this.plugin.settings.customSplits = v;
+                  await this.plugin.saveSettings();
+                });
+              ta.inputEl.rows = 4;
+            });
+          },
+        },
+        dropdown("linkOpen", t("settings.linkOpen.name"), t("settings.linkOpen.desc"), { current: t("settings.linkOpen.current"), tab: t("settings.linkOpen.tab"), split: t("settings.linkOpen.split") }, ["link", "链接", "分屏", "split", "打开"]),
+        toggle("linkFocusNote", t("settings.linkFocusNote.name"), t("settings.linkFocusNote.desc"), ["focus", "焦点", "分屏", "split"]),
+        toggle("linkReuseOpen", t("settings.linkReuseOpen.name"), t("settings.linkReuseOpen.desc"), ["link", "链接", "分屏", "split", "跳转", "已经打开"]),
+        dropdown("newNoteFolder", t("settings.newNoteFolder.name"), t("settings.newNoteFolder.desc"), { default: t("settings.newNoteFolder.default"), map: t("settings.newNoteFolder.map"), mapSub: t("settings.newNoteFolder.mapSub"), custom: t("settings.newNoteFolder.custom") }, ["folder", "文件夹", "新建", "位置", "存放"]),
+        text("newNoteFolderPath", t("settings.newNoteFolderPath.name"), t("settings.newNoteFolderPath.desc"), t("settings.newNoteFolderPath.placeholder"), ["folder", "文件夹", "路径"]),
+        dropdown("wheelAction", t("settings.wheel.name"), t("settings.wheel.desc"), { pan: t("settings.wheel.pan"), zoom: t("settings.wheel.zoom") }, ["scroll", "滚动", "缩放"]),
+        dropdown("embedWheel", t("settings.embedWheel.name"), t("settings.embedWheel.desc"), { click: t("settings.embedWheel.click"), always: t("settings.embedWheel.always") }, ["embed", "嵌入", "滚轮", "scroll", "锁定"]),
+        dropdown("leftDrag", t("settings.leftDrag.name"), t("settings.leftDrag.desc"), { pan: t("settings.leftDrag.pan"), select: t("settings.leftDrag.select") }, ["marquee", "框选", "平移"]),
+        toggle("dragToFloat", t("settings.dragToFloat.name"), t("settings.dragToFloat.desc")),
+        toggle("centerOnSelect", t("settings.centerOnSelect.name"), t("settings.centerOnSelect.desc"), ["center", "居中", "跟随"]),
+        toggle("hideSyntax", t("settings.hideSyntax.name"), t("settings.hideSyntax.desc"), ["markdown", "bold", "加粗", "荧光笔", "源码"]),
+        toggle("widthHandleOnHover", t("settings.widthHandleOnHover.name"), t("settings.widthHandleOnHover.desc"), ["width", "宽度", "手柄"]),
+        toggle("newNodeName", t("settings.newNodeName.name"), t("settings.newNodeName.desc"), ["new node", "新建", "默认名字", "主题1"]),
+        toggle("numberByTyping", t("settings.autoNumber.name"), t("settings.autoNumber.desc"), ["number", "编号", "序号", "有序列表"]),
+        toggle("strikeDoneTasks", t("settings.strikeDoneTasks.name"), t("settings.strikeDoneTasks.desc"), ["task", "任务", "删除线", "strikethrough"]),
+        toggle("copyPlain", t("settings.copyPlain.name"), t("settings.copyPlain.desc"), ["clipboard", "剪贴板"]),
+        toggle("pasteLinkTitle", t("settings.pasteLinkTitle.name"), t("settings.pasteLinkTitle.desc"), ["link", "url", "链接", "网址"]),
+        toggle("cleanAttachments", t("settings.cleanAttachments.name"), t("settings.cleanAttachments.desc"), ["image", "attachment", "delete", "图片", "附件", "删除", "回收站"]),
+        { name: t("settings.hover.name"), desc: t("settings.hover.desc", { source: t("hover.display") }), aliases: ["page preview", "页面预览"] },
+        group(t("settings.group.markers"), [
+          text("customMarkers", t("settings.customMarkers.name"), t("settings.customMarkers.desc"), "🎯 📎 ★ ◆", ["emoji", "icon", "图标"]),
+          toggle("customMarkersExclusive", t("settings.customMarkersExclusive.name"), t("settings.customMarkersExclusive.desc")),
+          text("answerMarker", t("settings.answerMarker.name"), t("settings.answerMarker.desc"), "🙈", ["recite", "review", "answer", "背诵", "复习", "答案", "猴子"]),
+        ]),
+        this.menuLayoutPage(),
+      ]),
+      page(
+        t("settings.group.toolbar"),
+        t("settings.page.toolbar"),
+        [
+          dropdown("toolbarPosition", t("settings.toolbar.name"), t("settings.toolbar.desc"), Object.fromEntries(TOOLBAR_POSITIONS.map((x) => [x.id, x.label]))),
+          toggle("inlineTitle", t("settings.inlineTitle.name"), t("settings.inlineTitle.desc"), ["title", "标题", "改名", "rename", "文件名"]),
+          toggle("showNodebar", t("settings.showNodebar.name"), t("settings.showNodebar.desc")),
+          dropdown("barPlacement", t("settings.barPlacement.name"), t("settings.barPlacement.desc"), { above: t("settings.barPlacement.above"), below: t("settings.barPlacement.below"), top: t("settings.barPlacement.top") }, ["toolbar", "format", "工具栏", "格式栏", "位置", "挡住"]),
+          toggle("zenHideObsidian", t("settings.zenHideObsidian.name"), t("settings.zenHideObsidian.desc")),
+          this.barLayoutPage("nodebarLayout"),
+          this.barLayoutPage("toolbarLayout"),
+          this.barLayoutPage("embedToolbarLayout"),
+          this.colorListSetting("nodeColors", "node", t("settings.nodeColors.name"), t("settings.nodeColors.desc"), ["palette", "色块", "调色板"]),
+          toggle("formatBar", t("settings.formatBar.name"), t("settings.formatBar.desc")),
+          this.colorListSetting("textColors", "text", t("settings.textColors.name"), t("settings.textColors.desc"), ["font color", "字体颜色"]),
+          this.colorListSetting("highlightColors", "bg", t("settings.highlightColors.name"), t("settings.highlightColors.desc"), ["highlight", "高亮", "背景色"]),
+        ],
+        () => t("settings.page.colorCount", { n: parseNodeColors(settings.nodeColors).length }),
+      ),
+      page(t("settings.group.notes"), t("settings.page.notes"), [
+        toggle("notesExpanded", t("settings.notesExpanded.name"), t("settings.notesExpanded.desc")),
+        dropdown(
+          "noteCardShow",
+          t("settings.noteCardShow.name"),
+          t("settings.noteCardShow.desc"),
+          { all: t("settings.noteCardShow.all"), list: t("settings.noteCardShow.list"), ordered: t("settings.noteCardShow.ordered"), unordered: t("settings.noteCardShow.unordered") },
+          ["list", "列表", "有序", "无序", "结论", "备注卡片"],
+        ),
+        toggle("quoteListNotes", t("settings.quoteListNotes.name"), t("settings.quoteListNotes.desc"), ["blockquote", "引用", ">", "首行缩进"]),
+        this.sliderWithReset("noteFontSize", t("settings.noteFontSize.name"), t("settings.noteFontSize.desc"), 11, 22, 1, DEFAULT_SETTINGS.noteFontSize, t("settings.resetNoteFontSize"), () => this.plugin.applyDisplayScale()),
+        this.sizeSetting("noteMaxHeight", t("settings.noteMaxHeight.name"), t("settings.noteMaxHeight.desc"), 120, 800, t("settings.resetNoteHeight")),
+        this.sizeSetting("noteMaxWidth", t("settings.noteMaxWidth.name"), t("settings.noteMaxWidth.desc"), 160, 960, t("settings.resetNoteWidth")),
+        this.notePopoverSetting(),
+        this.sizeSetting("tableMaxWidth", t("settings.tableMaxWidth.name"), t("settings.tableMaxWidth.desc"), 320, 4000, t("settings.resetTableWidth")),
+        this.sizeSetting("tableMaxHeight", t("settings.tableMaxHeight.name"), t("settings.tableMaxHeight.desc"), 160, 3000, t("settings.resetTableHeight")),
+        toggle("noteLiveEdit", t("settings.noteLiveEdit.name"), t("settings.noteLiveEdit.desc"), ["所见即所得", "WYSIWYG", "实时预览", "live preview", "编辑器"]),
+        toggle("notePreview", t("settings.notePreview.name"), t("settings.notePreview.desc")),
+      ]),
+      page(t("settings.group.markdown"), t("settings.page.markdown"), [
+        group(t("settings.group.parse"), [
+          toggle("headingsOnly", t("settings.headingsOnly.name"), t("settings.headingsOnly.desc")),
+          dropdown("maxHeadingLevel", t("settings.headingLevel.name"), t("settings.headingLevel.desc"), { "2": t("settings.headingLevel.h2"), "3": "H3", "4": "H4", "5": "H5", "6": "H6" }),
+        ]),
+        group(t("settings.group.sync"), [
+          toggle("syncSplit", t("settings.syncSplit.name"), t("settings.syncSplit.desc"), ["split", "分屏", "联动"]),
+          dropdown("splitMapSide", t("settings.splitMapSide.name"), t("settings.splitMapSide.desc"), { right: t("settings.splitMapSide.right"), left: t("settings.splitMapSide.left") }, ["split", "分屏", "对照", "左边", "右边", "left", "right"]),
+          toggle("followExpand", t("settings.followExpand.name"), t("settings.followExpand.desc")),
+          toggle("foldFollow", t("settings.foldFollow.name"), t("settings.foldFollow.desc"), ["fold", "折叠"]),
+          toggle("followActiveNote", t("settings.followActive.name"), t("settings.followActive.desc"), ["sidebar", "侧边栏"]),
+          toggle("outlineWrap", t("settings.outlineWrap.name"), t("settings.outlineWrap.desc"), ["outline", "大纲"]),
+          toggle("outlineFoldSync", t("settings.outlineFoldSync.name"), t("settings.outlineFoldSync.desc"), ["outline", "大纲", "fold", "折叠"]),
+        ]),
+        group(t("settings.group.noteDisplay"), [
+          toggle("hideTagsInNotes", t("settings.hideTagsInNotes.name"), t("settings.hideTagsInNotes.desc"), ["html", "span", "mark", "标签", "下划线", "underline", "颜色"]),
+          toggle("colorsInNotes", t("settings.colorsInNotes.name"), t("settings.colorsInNotes.desc"), ["color", "颜色", "背景", "底色", "节点颜色"]),
+          ...(Platform.isMobile ? [] : [toggle("formatBarInNotes", t("settings.formatBarInNotes.name"), t("settings.formatBarInNotes.desc"), ["format", "toolbar", "格式栏", "工具栏", "颜色", "荧光笔", "加粗"])]),
+          dropdown(
+            "markersInNotes",
+            t("settings.markersInNotes.name"),
+            t("settings.markersInNotes.desc"),
+            { show: t("settings.markersInNotes.show"), dot: t("settings.markersInNotes.dot"), hide: t("settings.markersInNotes.hide") },
+            ["%%", "marker", "comment", "标记", "注释", "隐藏"],
+          ),
+        ]),
+        group(t("settings.group.embed"), [
+          toggle("claimMindmapBlock", t("settings.claimBlock.name"), t("settings.claimBlock.desc"), ["code block", "代码块"]),
+          {
+            name: t("settings.codeBlockHeight.name"),
+            desc: t("settings.codeBlockHeight.desc"),
+            control: { type: "number", key: "codeBlockMaxHeight", min: 120, validate: (v) => (Number.isFinite(v) && v >= 120 ? undefined : "≥ 120") },
+          },
+        ]),
+      ]),
+      page(t("settings.group.newMap"), t("settings.page.newMap"), [
+        this.templateSetting(),
+        dropdown("newMapFolder", t("settings.newMapFolder.name"), t("settings.newMapFolder.desc"), { default: t("settings.newMapFolder.default"), current: t("settings.newMapFolder.current"), custom: t("settings.newMapFolder.custom") }, ["folder", "文件夹", "新建", "位置", "存放"]),
+        text("newMapFolderPath", t("settings.newMapFolderPath.name"), t("settings.newMapFolderPath.desc"), t("settings.newNoteFolderPath.placeholder"), ["folder", "文件夹", "路径"]),
+        dropdown("indent", t("settings.indent.name"), t("settings.indent.desc"), {
+          tab: t("settings.indent.tab"),
+          "2": t("settings.indent.spaces", { n: 2 }),
+          "4": t("settings.indent.spaces", { n: 4 }),
+        }),
+        toggle("fileNameAsRoot", t("settings.fileNameAsRoot.name"), t("settings.fileNameAsRoot.desc")),
+        toggle("renameWithRoot", t("settings.renameWithRoot.name"), t("settings.renameWithRoot.desc")),
+        this.listIconSetting(),
+      ]),
+      this.reviewPage(),
+      this.customThemesPage(),
+      // 诊断（只在电脑端）：异常时的副本、详细记录、导出
+      ...(this.plugin.diag ? [page(t("settings.group.diag"), t("settings.page.diag"), diagSettingDefinitions(this.app, this.plugin.diag))] : []),
+      {
+        name: t("settings.support.name"),
+        desc: t("settings.support.desc"),
+        render: (setting) => {
+          setting.addButton((b) => b.setButtonText(t("settings.support.button")).onClick(() => window.open(FUNDING_URL)));
+        },
+      },
+    ];
+  }
+
+  /** 间隔复习：数字、阶段这些存在 settings.review 里，自己画输入框 */
+  private reviewPage(): SettingDefinitionItem {
+    const prefs = () => this.plugin.settings.review;
+    const save = async () => {
+      await this.plugin.saveSettings();
+      this.plugin.review?.changed();
+    };
+    const num = (key: "newPerDay" | "reviewPerDay" | "dayStartHour", name: string, desc: string, min: number, max: number): SettingDefinition => ({
+      name,
+      desc,
+      aliases: ["anki", "复习", "review", "flashcard", "卡片"],
+      render: (setting) => {
+        setting.addText((tx) => {
+          tx.inputEl.type = "number";
+          tx.inputEl.min = String(min);
+          tx.inputEl.max = String(max);
+          tx.inputEl.addClass("mm-settings-number");
+          tx.setValue(String(prefs()[key])).onChange(async (v) => {
+            const n = Math.round(Number(v));
+            if (!Number.isFinite(n) || n < min || n > max) return;
+            prefs()[key] = n;
+            await save();
+          });
+        });
+      },
+    });
+    const steps = (key: "learningSteps" | "relearningSteps", name: string, desc: string): SettingDefinition => ({
+      name,
+      desc,
+      aliases: ["anki", "复习", "review", "step", "阶段"],
+      render: (setting) => {
+        setting.addText((tx) =>
+          tx
+            .setPlaceholder(DEFAULT_REVIEW_PREFS[key])
+            .setValue(prefs()[key])
+            .onChange(async (v) => {
+              prefs()[key] = v.trim() || DEFAULT_REVIEW_PREFS[key];
+              await save();
+            }),
+        );
+      },
+    });
+    const toggle = (key: "reviewDueDots" | "reviewTimer" | "reviewCrumb", name: string, desc: string): SettingDefinition => ({ name, desc, control: { type: "toggle", key } });
+    return {
+      type: "page",
+      name: t("settings.review.heading"),
+      desc: t("settings.review.intro"),
+      items: [
+        num("newPerDay", t("settings.review.newPerDay.name"), t("settings.review.newPerDay.desc"), 0, 9999),
+        num("reviewPerDay", t("settings.review.reviewPerDay.name"), t("settings.review.reviewPerDay.desc"), 0, 99999),
+        steps("learningSteps", t("settings.review.learningSteps.name"), t("settings.review.learningSteps.desc")),
+        steps("relearningSteps", t("settings.review.relearningSteps.name"), t("settings.review.relearningSteps.desc")),
+        {
+          name: t("settings.review.retention.name"),
+          desc: t("settings.review.retention.desc"),
+          aliases: ["anki", "fsrs", "retention", "记忆率"],
+          render: (setting) => {
+            setting.addSlider((sl) =>
+              sl
+                .setLimits(0.7, 0.99, 0.01)
+                .setValue(prefs().retention)
+                .onChange(async (v) => {
+                  prefs().retention = Math.round(v * 100) / 100;
+                  await save();
+                }),
+            );
+          },
+        },
+        num("dayStartHour", t("settings.review.dayStart.name"), t("settings.review.dayStart.desc"), 0, 23),
+        toggle("reviewDueDots", t("settings.review.dueDots.name"), t("settings.review.dueDots.desc")),
+        toggle("reviewCrumb", t("settings.review.crumb.name"), t("settings.review.crumb.desc")),
+        toggle("reviewTimer", t("settings.review.timer.name"), t("settings.review.timer.desc")),
+      ],
+      displayValue: () => t("settings.review.perDay", { n: this.plugin.settings.review.newPerDay }),
+    };
+  }
+
+  /** 节点间距、字号：滑块加一个恢复 100% 的按钮（声明式的滑块没有按钮，自己画） */
+  private scaleSetting(key: "spacingScale" | "fontScale", name: string, desc: string, min: number, max: number): SettingDefinition {
+    return this.sliderWithReset(key, name, desc, min, max, 5, 100, t("settings.reset"), () => this.plugin.applyDisplayScale());
+  }
+
+  /**
+   * 颜色清单（节点颜色、常用文字颜色、常用荧光笔颜色）：一排色块，点色块打开色板换颜色，× 删除，拖动调顺序，+ 新增；
+   * 「直接写色值」切换成原来的文本框（颜色名、🔴、rgba() 这些也能直接写）。存的还是逗号隔开的字符串，和以前一样
+   */
+  private colorListSetting(key: "nodeColors" | "textColors" | "highlightColors" | "levelPalette", kind: ColorKind, name: string, desc: string, aliases: string[]): SettingDefinition {
+    const plugin = this.plugin;
+    const fallback = key === "nodeColors" ? DEFAULT_NODE_COLORS : key === "textColors" ? DEFAULT_TEXT_COLORS : key === "levelPalette" ? DEFAULT_LEVEL_COLORS : DEFAULT_HIGHLIGHT_COLORS;
+    const read = () =>
+      plugin.settings[key]
+        .split(/[,，\s]+(?![^(]*\))/)
+        .map((x) => x.trim())
+        .filter(Boolean);
+    const save = async (list: string[]) => {
+      plugin.settings[key] = list.join(", ");
+      await plugin.saveSettings();
+      refreshAllBars();
+      if (key === "levelPalette") {
+        plugin.resetNodeDecor();
+        redrawAllCanvases();
+      }
+    };
+    const label = (c: string) => (kind === "node" ? colorLabel(c) : colorTitle(c));
+    let raw = false;
+    return {
+      name,
+      desc,
+      aliases,
+      render: (setting) => {
+        const ctl = setting.controlEl;
+        const draw = () => {
+          ctl.empty();
+          ctl.addClass("mm-color-list-ctl");
+          if (raw) {
+            const input = ctl.createEl("input", { type: "text", cls: "mm-color-list-raw" });
+            input.value = plugin.settings[key];
+            input.placeholder = fallback;
+            input.addEventListener("change", () => {
+              plugin.settings[key] = input.value;
+              void plugin.saveSettings().then(() => {
+                refreshAllBars();
+                if (key === "levelPalette") {
+                  plugin.resetNodeDecor();
+                  redrawAllCanvases();
+                }
+              });
+            });
+          } else {
+            const list = read();
+            const row = ctl.createDiv({ cls: "mm-color-list" });
+            let dragFrom = -1;
+            list.forEach((c, i) => {
+              const chip = row.createDiv({ cls: "mm-color-chip" });
+              chip.draggable = true;
+              chip.setAttr("aria-label", label(c));
+              const sw = chip.createSpan({ cls: "mm-color-chip-swatch" });
+              paintColor(sw, c, kind);
+              chip.createSpan({ cls: "mm-color-chip-name", text: label(c) });
+              const x = chip.createSpan({ cls: "mm-color-chip-x" });
+              setIcon(x, "x");
+              x.addEventListener("click", (ev) => {
+                ev.stopPropagation();
+                const next = read();
+                next.splice(i, 1);
+                void save(next).then(draw);
+              });
+              chip.addEventListener("click", () =>
+                openPalette(chip, (picked) => {
+                  const next = read();
+                  if (picked === null) next.splice(i, 1);
+                  else next[i] = picked;
+                  void save(next).then(draw);
+                }),
+              );
+              chip.addEventListener("dragstart", () => (dragFrom = i));
+              chip.addEventListener("dragover", (ev) => ev.preventDefault());
+              chip.addEventListener("drop", (ev) => {
+                ev.preventDefault();
+                if (dragFrom < 0 || dragFrom === i) return;
+                const next = read();
+                const [moved] = next.splice(dragFrom, 1);
+                next.splice(i, 0, moved);
+                dragFrom = -1;
+                void save(next).then(draw);
+              });
+            });
+            const add = row.createEl("button", { cls: "mm-color-list-add" });
+            setIcon(add, "plus");
+            add.setAttr("aria-label", t("settings.colorAdd"));
+            add.addEventListener("click", () =>
+              openPalette(add, (picked) => {
+                if (picked === null) return;
+                void save([...read(), picked]).then(draw);
+              }),
+            );
+          }
+          const toggleRaw = ctl.createEl("a", { cls: "mm-color-list-mode", text: raw ? t("settings.colorChips") : t("settings.colorRaw") });
+          toggleRaw.addEventListener("click", () => {
+            raw = !raw;
+            draw();
+          });
+        };
+        /** 设置页里的色板：挂在 body 上，点外面关掉 */
+        const openPalette = (anchor: HTMLElement, done: (c: string | null) => void) => {
+          const doc = anchor.ownerDocument;
+          doc.querySelectorAll(".mm-settings-palette").forEach((e) => e.remove());
+          const pal = createPalette(doc, {
+            text: paletteText(),
+            common: kind === "node" ? [...COLOR_NAMES] : kind === "bg" ? ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣"] : [],
+            recent: plugin.colorMemory.recent(kind),
+            alpha: kind !== "node",
+            defaultAlpha: kind === "bg" ? 60 : 100,
+            paint: (b, c) => paintColor(b, c, kind),
+            label,
+            noneLabel: t("settings.colorRemove"),
+            extras: kind === "bg" ? [{ value: THEME_HIGHLIGHT, label: t("palette.themeHighlight"), paint: (b) => paintColor(b, THEME_HIGHLIGHT, "bg") }] : [],
+            onPick: (c) => {
+              close();
+              done(c);
+            },
+          });
+          pal.addClass("mm-settings-palette");
+          doc.body.append(pal);
+          const r = anchor.getBoundingClientRect();
+          const win = doc.defaultView ?? window;
+          pal.style.left = `${Math.max(8, Math.min(win.innerWidth - pal.offsetWidth - 8, r.left))}px`;
+          const below = r.bottom + 6;
+          pal.style.top = `${below + pal.offsetHeight < win.innerHeight - 8 ? below : Math.max(8, r.top - pal.offsetHeight - 6)}px`;
+          const onDown = (ev: PointerEvent) => {
+            if (!pal.contains(ev.target as Node)) close();
+          };
+          const close = () => {
+            pal.remove();
+            doc.removeEventListener("pointerdown", onDown, true);
+          };
+          doc.addEventListener("pointerdown", onDown, true);
+        };
+        draw();
+      },
+    };
+  }
+
+  /**
+   * 浮动工具栏 / 主工具栏的按钮：一个子页面，一行一个按钮（图标、名字、开关、上移下移），最上面「恢复默认」。
+   * 改了马上存、所有打开着的脑图重建工具栏
+   */
+  private barLayoutPage(key: "nodebarLayout" | "toolbarLayout" | "embedToolbarLayout"): SettingDefinitionItem {
+    const plugin = this.plugin;
+    const defaults = key === "nodebarLayout" ? nodebarDefault(Platform.isMobile) : key === "toolbarLayout" ? TOOLBAR_DEFAULT : EMBED_TOOLBAR_DEFAULT;
+    const embed = key === "embedToolbarLayout";
+    const items = () => mergeLayout(plugin.settings[key], defaults);
+    const save = async (next: BarItem[]) => {
+      plugin.settings[key] = sameAsDefault(next, defaults) ? [] : encodeLayout(next);
+      await plugin.saveSettings();
+      refreshAllBars();
+      this.refresh();
+    };
+    const ICON: Record<string, string> = { embed: "open", colors: "palette", highlight: "highlighter", moveUp: "up", moveDown: "down", zoomOut: "minus", zoomIn: "plus", notes: "note", hidden: "hiddenNodes" };
+    const list = items();
+    const at = (id: string) => items().findIndex((x) => x.id === id);
+    const rows: SettingDefinition[] = list.map((item, i) => ({
+      name: isSep(item.id) ? t("bar.sep") : t(`bar.${item.id}` as Parameters<typeof t>[0]),
+      desc: isSep(item.id) ? t("bar.sepDesc") : item.id === "embed" ? t("bar.embedDesc") : item.id === "expand" ? t("bar.expandDesc") : "",
+      aliases: ["toolbar", "button", "工具栏", "按钮"],
+      render: (setting) => {
+        const name = ICON[item.id] ?? item.id;
+        // Obsidian 重画设置页时会沿用同一个行元素再调一次 render：先把上次加的图标、把手去掉，免得越加越多
+        setting.settingEl.querySelectorAll(".mm-setting-bar-grip, .mm-setting-bar-icon").forEach((e) => e.remove());
+        if (!isSep(item.id) && item.id !== "zoom") {
+          const ic = toolIcon(name);
+          ic.addClass("mm-setting-bar-icon");
+          setting.nameEl.prepend(ic);
+        }
+        setting.settingEl.toggleClass("mm-setting-bar-off", !item.on);
+        // 拖动把手：按住拖到别的位置。只在这一页里（整张清单都在同一个容器里）能拖，设置搜索结果里只留箭头
+        setting.settingEl.addClass("mm-setting-bar-row");
+        setting.settingEl.dataset.mmBar = key;
+        setting.settingEl.dataset.mmId = item.id;
+        const grip = setting.settingEl.createDiv({ cls: "mm-setting-bar-grip" });
+        setIcon(grip, "grip-vertical");
+        // 不挂 aria-label：Obsidian 会给它弹提示，拖动时提示跟不上、还挡着；怎么拖写在这一页最上面的说明里
+        setting.settingEl.prepend(grip);
+        // 画完挂上去以后看一眼：清单不全（设置搜索结果里）就不显示把手
+        window.requestAnimationFrame(() => {
+          const sib = setting.settingEl.parentElement?.querySelectorAll(`:scope > .mm-setting-bar-row[data-mm-bar="${key}"]`).length ?? 0;
+          grip.toggleClass("is-hidden", sib !== list.length);
+        });
+        grip.addEventListener("pointerdown", (ev) => dragRow(ev, setting.settingEl, key, list.length, (fromId, toId) => void save(moveTo(items(), at(fromId), at(toId)))));
+        setting
+          .addExtraButton((b) =>
+            b
+              .setIcon("arrow-up")
+              .setTooltip(t("bar.moveUp"))
+              .setDisabled(i === 0)
+              .onClick(() => void save(moveItem(items(), at(item.id), -1))),
+          )
+          .addExtraButton((b) =>
+            b
+              .setIcon("arrow-down")
+              .setTooltip(t("bar.moveDown"))
+              .setDisabled(i === list.length - 1)
+              .onClick(() => void save(moveItem(items(), at(item.id), 1))),
+          )
+          .addToggle((tg) =>
+            tg.setValue(item.on).onChange((v) => {
+              // 按 id 在最新的设置里找（页面刷新后各行的回调可能还是旧的）
+              const next = items();
+              const j = at(item.id);
+              if (j >= 0) next[j] = { ...next[j], on: v };
+              void save(next);
+            }),
+          );
+      },
+    }));
+    const reset: SettingDefinition = {
+      name: t("bar.reset"),
+      desc: t(key === "nodebarLayout" ? "bar.nodebarDesc" : "bar.toolbarDesc"),
+      render: (setting) => {
+        setting.addButton((b) =>
+          b
+            .setButtonText(t("bar.resetButton"))
+            .setDisabled(!plugin.settings[key].length)
+            .onClick(() => void save(mergeLayout(undefined, defaults))),
+        );
+      },
+    };
+    const count = () => {
+      const all = items().filter((x) => !isSep(x.id));
+      return t("bar.count", { n: all.filter((x) => x.on).length, total: all.length });
+    };
+    if (!embed) {
+      return {
+        type: "page",
+        name: t(key === "nodebarLayout" ? "bar.nodebarPage" : "bar.toolbarPage"),
+        desc: t(key === "nodebarLayout" ? "bar.nodebarPageDesc" : "bar.toolbarPageDesc"),
+        displayValue: count,
+        items: [reset, ...rows],
+      };
+    }
+    // 嵌入的脑图：最上面先选完整 / 自定义 / 自动隐藏，选了自定义才列按钮
+    const modes = { full: t("settings.embedToolbar.full"), custom: t("settings.embedToolbar.custom"), autohide: t("settings.embedToolbar.autohide") };
+    const mode: SettingDefinition = {
+      name: t("settings.embedToolbar.name"),
+      desc: t("settings.embedToolbar.desc"),
+      aliases: ["embed", "嵌入", "简洁", "隐藏", "toolbar", "工具栏"],
+      control: { type: "dropdown", key: "embedToolbar", options: modes },
+    };
+    return {
+      type: "page",
+      name: t("bar.embedPage"),
+      desc: t("bar.embedPageDesc"),
+      displayValue: () => (plugin.settings.embedToolbar === "custom" ? `${modes.custom} · ${count()}` : modes[plugin.settings.embedToolbar]),
+      items: plugin.settings.embedToolbar === "custom" ? [mode, reset, ...rows] : [mode],
+    };
+  }
+
+  /**
+   * 节点右键菜单：一行一项，下拉选第一层 / 更多里 / 不显示（核心操作没有「不显示」），最上面「恢复默认」。
+   * 菜单每次右键时现取设置，存了就生效，不用重画
+   */
+  private menuLayoutPage(): SettingDefinitionItem {
+    const plugin = this.plugin;
+    const save = async (id: string, place: MenuPlace) => {
+      plugin.settings.menuLayout = cleanLayout({ ...plugin.settings.menuLayout, [id]: place });
+      await plugin.saveSettings();
+    };
+    const label = (key: string) => t(key as Parameters<typeof t>[0]).replace(/…$/, "");
+    const reset: SettingDefinition = {
+      name: t("menuLayout.reset"),
+      desc: t("menuLayout.resetDesc"),
+      render: (setting) => {
+        setting.addButton((b) =>
+          b
+            .setButtonText(t("menuLayout.resetButton"))
+            .onClick(async () => {
+              plugin.settings.menuLayout = {};
+              await plugin.saveSettings();
+              this.refresh();
+            }),
+        );
+      },
+    };
+    const rows: SettingDefinition[] = MENU_ITEMS.map((def) => ({
+      name: label(def.label),
+      desc: [t(def.place === "top" ? "menuLayout.defaultTop" : "menuLayout.defaultMore"), def.locked ? t("menuLayout.locked") : ""].filter(Boolean).join(" · "),
+      aliases: ["menu", "context menu", "右键", "菜单", "更多"],
+      render: (setting) => {
+        setting.addDropdown((d) => {
+          d.addOption("top", t("menuLayout.top")).addOption("more", t("menuLayout.more"));
+          if (!def.locked) d.addOption("hidden", t("menuLayout.hidden"));
+          // 不重画页面：键盘上下切换时焦点还留在这个下拉框里
+          d.setValue(placeOf(def.id, plugin.settings.menuLayout)).onChange((v) => void save(def.id, v as MenuPlace));
+        });
+      },
+    }));
+    return {
+      type: "page",
+      name: t("menuLayout.page"),
+      desc: t("menuLayout.pageDesc"),
+      displayValue: () => {
+        const n = Object.keys(plugin.settings.menuLayout ?? {}).length;
+        return n ? t("menuLayout.count", { changed: n }) : "";
+      },
+      items: [reset, ...rows],
+    };
+  }
+
+  /** 查看备注窗口的默认大小：宽、高两个数字框，都留空 = 按内容自动。各条备注拖过的尺寸记在文件状态里，不受这里影响 */
+  private notePopoverSetting(): SettingDefinition {
+    return {
+      name: t("settings.notePopover.name"),
+      desc: t("settings.notePopover.desc"),
+      render: (setting) => {
+        const inputs: { setValue(v: string): unknown }[] = [];
+        const cur = this.plugin.settings.notePopoverSize;
+        let w = cur ? String(cur.w) : "";
+        let h = cur ? String(cur.h) : "";
+        const save = async () => {
+          const nw = Number(w);
+          const nh = Number(h);
+          if (!w.trim() && !h.trim()) this.plugin.settings.notePopoverSize = undefined;
+          else if (nw >= 160 && nh >= 48) this.plugin.settings.notePopoverSize = { w: Math.round(Math.min(4000, nw)), h: Math.round(Math.min(4000, nh)) };
+          else return;
+          await this.plugin.saveSettings();
+        };
+        for (const [label, get, set] of [
+          [t("settings.notePopover.w"), () => w, (v: string) => (w = v)],
+          [t("settings.notePopover.h"), () => h, (v: string) => (h = v)],
+        ] as const) {
+          setting.addText((tx) => {
+            inputs.push(tx);
+            tx.inputEl.type = "number";
+            tx.inputEl.addClass("mm-setting-size");
+            tx.inputEl.setAttribute("aria-label", label);
+            tx.setPlaceholder(`${label} · ${t("settings.notePopover.auto")}`)
+              .setValue(get())
+              .onChange((v) => {
+                set(v);
+                void save();
+              });
+          });
+        }
+        setting.addExtraButton((b) =>
+          b
+            .setIcon("rotate-ccw")
+            .setTooltip(t("settings.notePopover.reset"))
+            .onClick(async () => {
+              w = h = "";
+              for (const i of inputs) i.setValue("");
+              this.plugin.settings.notePopoverSize = undefined;
+              await this.plugin.saveSettings();
+            }),
+        );
+      },
+    };
+  }
+
+  private sizeSetting(key: "noteMaxHeight" | "noteMaxWidth" | "tableMaxWidth" | "tableMaxHeight" | "imageMaxWidth" | "imageThumbWidth", name: string, desc: string, min: number, max: number, resetTip: string): SettingDefinition {
+    return this.sliderWithReset(key, name, desc, min, max, 20, DEFAULT_SETTINGS[key], resetTip, () => this.plugin.applyDisplayScale());
+  }
+
+  private sliderWithReset(
+    key: "spacingScale" | "fontScale" | "noteFontSize" | "noteMaxHeight" | "noteMaxWidth" | "tableMaxWidth" | "tableMaxHeight" | "imageMaxWidth" | "imageThumbWidth" | "pdfBorderFade",
+    name: string,
+    desc: string,
+    min: number,
+    max: number,
+    step: number,
+    reset: number,
+    resetTip: string,
+    apply: () => void,
+  ): SettingDefinition {
+    return {
+      name,
+      desc,
+      render: (setting) => {
+        let slider: { setValue(v: number): unknown } | null = null;
+        setting
+          .addSlider((s) => {
+            slider = s;
+            s.setLimits(min, max, step)
+              .setValue(this.plugin.settings[key])
+              .onChange(async (v) => {
+                this.plugin.settings[key] = v;
+                await this.plugin.saveSettings();
+                apply();
+              });
+          })
+          .addExtraButton((b) =>
+            b
+              .setIcon("rotate-ccw")
+              .setTooltip(resetTip)
+              .onClick(async () => {
+                this.plugin.settings[key] = reset;
+                slider?.setValue(reset);
+                await this.plugin.saveSettings();
+                apply();
+              }),
+          );
+      },
+    };
+  }
+
+  /** 模板：文字框带笔记补全 */
+  private templateSetting(): SettingDefinition {
+    return {
+      name: t("settings.template.name"),
+      desc: t("settings.template.desc"),
+      render: (setting) => {
+        setting.addText((text) => {
+          text
+            .setPlaceholder(t("settings.template.placeholder"))
+            .setValue(this.plugin.settings.newFileTemplate)
+            .onChange(async (v) => {
+              this.plugin.settings.newFileTemplate = v.trim();
+              await this.plugin.saveSettings();
+            });
+          new NoteSuggest(this.app, text.inputEl);
+        });
+      },
+    };
+  }
+
+  /** 文件列表里的图标：预览 + 选择 / 恢复默认 / 去掉 */
+  private listIconSetting(): SettingDefinition {
+    return {
+      name: t("settings.listIcon.name"),
+      desc: t("settings.listIcon.desc", { command: t("command.addListIcons") }),
+      aliases: ["icon", "图标"],
+      render: (setting) => {
+        const preview = setting.controlEl.createSpan({ cls: "mm-setting-icon-preview" });
+        const label = setting.controlEl.createSpan({ cls: "mm-setting-icon-value" });
+        const refresh = () => {
+          const v = this.plugin.settings.listIcon;
+          preview.empty();
+          preview.toggleClass("is-emoji", isEmojiValue(v));
+          if (!v) {
+            label.setText(t("settings.listIcon.none"));
+            return;
+          }
+          if (isEmojiValue(v)) preview.setText(displayEmoji(v));
+          else {
+            const id = iconIdOf(v);
+            if (id) setIcon(preview, id);
+          }
+          label.setText(v);
+        };
+        refresh();
+        const set = async (v: string) => {
+          this.plugin.settings.listIcon = v;
+          await this.plugin.saveSettings();
+          refresh();
+        };
+        setting
+          .addButton((b) =>
+            b
+              .setButtonText(t("settings.listIcon.choose"))
+              .setCta()
+              .onClick(() => {
+                new IconPickerModal(this.app, (pick) => {
+                  if (pick) void set(storedValue(pick));
+                }).open();
+              }),
+          )
+          .addExtraButton((b) =>
+            b
+              .setIcon("rotate-ccw")
+              .setTooltip(t("settings.listIcon.reset"))
+              .onClick(() => void set(MINDMAP_LIST_ICON)),
+          )
+          .addExtraButton((b) =>
+            b
+              .setIcon("x")
+              .setTooltip(t("settings.listIcon.clear"))
+              .onClick(() => void set("")),
+          );
+      },
+    };
+  }
+
+  /** 自定义主题：一个子页面，列表（编辑 / 复制 / 删除）+ 选基础主题新建 */
+  private customThemesPage(): SettingDefinitionItem {
+    const plugin = this.plugin;
+    const save = async (theme: CustomTheme) => {
+      const list = plugin.settings.customThemes;
+      const i = list.findIndex((x) => x.id === theme.id);
+      if (i >= 0) list[i] = theme;
+      else list.push(theme);
+      await plugin.saveSettings();
+      plugin.applyCustomThemes();
+      this.refresh();
+    };
+    const rows: SettingDefinition[] = plugin.settings.customThemes.map((theme) => ({
+      name: theme.name,
+      desc: t("customTheme.basedOn", { base: themeShortLabel(theme.base) }),
+      render: (setting) => {
+        setting
+          .addButton((b) => b.setButtonText(t("customTheme.edit")).onClick(() => new CustomThemeModal(this.app, plugin, theme, (x) => void save(x)).open()))
+          .addButton((b) =>
+            b.setButtonText(t("customTheme.duplicate")).onClick(() => {
+              const copy = { ...structuredClone(theme), id: newCustomThemeId(), name: t("customTheme.copyName", { name: theme.name }) };
+              void save(copy);
+            }),
+          )
+          .addExtraButton((b) =>
+            b
+              .setIcon("trash")
+              .setTooltip(t("customTheme.delete"))
+              .onClick(() =>
+                new ConfirmModal(this.app, t("customTheme.deleteConfirm", { name: theme.name }), () => {
+                  plugin.settings.customThemes = plugin.settings.customThemes.filter((x) => x.id !== theme.id);
+                  if (plugin.settings.defaultTheme === theme.id) plugin.settings.defaultTheme = "snow";
+                  void plugin.saveSettings().then(() => {
+                    plugin.applyCustomThemes();
+                    this.refresh();
+                  });
+                }).open(),
+              ),
+          );
+      },
+    }));
+    let base: ThemeName = "snow";
+    rows.push({
+      name: t("customTheme.new"),
+      desc: t("customTheme.newDesc"),
+      render: (setting) => {
+        setting
+          .addDropdown((d) =>
+            d
+              .addOptions(Object.fromEntries(THEME_LIST.map((th) => [th.name, themeShortLabel(th.name)])))
+              .setValue(base)
+              .onChange((v) => (base = v as ThemeName)),
+          )
+          .addButton((b) =>
+            b
+              .setButtonText(t("customTheme.create"))
+              .setCta()
+              .onClick(() => {
+                const name = t("customTheme.defaultName", { n: plugin.settings.customThemes.length + 1 });
+                new CustomThemeModal(this.app, plugin, themeFromBase(base, name, newCustomThemeId()), (x) => void save(x)).open();
+              }),
+          );
+      },
+    });
+    return {
+      type: "page",
+      name: t("customTheme.heading"),
+      desc: t("settings.customThemes.desc"),
+      displayValue: () => t("settings.page.themeCount", { n: plugin.settings.customThemes.length }),
+      items: rows,
+    };
+  }
+}
+
+/**
+ * 旧版 Obsidian（没有声明式设置）：按清单逐项画。分组画成小标题，子页面就地展开；
+ * 控件只有清单里用到的几种（开关、下拉、文字、数字），其余是 render 自己画
+ */
+function renderFallback(el: HTMLElement, items: readonly unknown[], tab: MindMapSettingTab): void {
+  for (const raw of items) {
+    const item = raw as SettingDefinitionItem;
+    if ("type" in item && (item.type === "group" || item.type === "list" || item.type === "page")) {
+      const heading = item.type === "page" ? item.name : item.heading;
+      if (heading) new Setting(el).setName(heading).setHeading();
+      renderFallback(el, item.items ?? [], tab);
+      continue;
+    }
+    const def = item as SettingDefinition;
+    const setting = new Setting(el).setName(def.name);
+    if (def.desc) setting.setDesc(def.desc);
+    if (def.render) {
+      def.render(setting, undefined as never);
+      continue;
+    }
+    const c = def.control;
+    if (!c) continue;
+    const value = tab.getControlValue(c.key);
+    const set = (v: unknown) => void tab.setControlValue(c.key, v);
+    switch (c.type) {
+      case "toggle":
+        setting.addToggle((tg) => tg.setValue(Boolean(value)).onChange(set));
+        break;
+      case "dropdown":
+        setting.addDropdown((d) => d.addOptions(c.options).setValue(String(value)).onChange(set));
+        break;
+      case "text":
+        setting.addText((tx) => tx.setPlaceholder(c.placeholder ?? "").setValue(typeof value === "string" ? value : "").onChange(set));
+        break;
+      case "number":
+        setting.addText((tx) => {
+          tx.inputEl.type = "number";
+          tx.setValue(String(value)).onChange((v) => {
+            const n = Number(v);
+            if (!c.validate || !c.validate(n)) set(n);
+          });
+        });
+        break;
+      default:
+        break;
+    }
+  }
+}
+
+/** 设置里选模板笔记：输入时列出名字或路径匹配的 Markdown 笔记 */
+class NoteSuggest extends AbstractInputSuggest<TFile> {
+  constructor(app: App, private input: HTMLInputElement) {
+    super(app, input);
+  }
+
+  getSuggestions(query: string): TFile[] {
+    const q = query.trim().toLowerCase();
+    return this.app.vault
+      .getMarkdownFiles()
+      .filter((f) => f.path.toLowerCase().includes(q))
+      .sort((a, b) => a.path.localeCompare(b.path))
+      .slice(0, 50);
+  }
+
+  renderSuggestion(file: TFile, el: HTMLElement): void {
+    el.setText(file.path);
+  }
+
+  selectSuggestion(file: TFile): void {
+    this.setValue(file.path);
+    this.input.dispatchEvent(new Event("input"));
+    this.close();
+  }
+}
+
+/**
+ * 拖动工具栏按钮那几行：按住把手，这一行跟着指针走，别的行让位；松手按新位置存。
+ * 用指针事件自己做（手机上手指也能拖）；拖到设置窗口上下边缘时自动滚动
+ */
+function dragRow(ev: PointerEvent, row: HTMLElement, key: string, total: number, done: (fromId: string, toId: string) => void): void {
+  const parent = row.parentElement;
+  if (!parent || ev.button !== 0) return;
+  const rows = [...parent.querySelectorAll<HTMLElement>(`:scope > .mm-setting-bar-row[data-mm-bar="${key}"]`)];
+  // 设置搜索结果里清单不全：不拖
+  if (rows.length !== total) return;
+  ev.preventDefault();
+  const from = rows.indexOf(row);
+  if (from < 0) return;
+  const grip = ev.currentTarget as HTMLElement;
+  grip.setPointerCapture(ev.pointerId);
+  const win = row.win;
+  let scroller: HTMLElement | null = parent;
+  while (scroller && !(scroller.scrollHeight > scroller.clientHeight + 1 && /(auto|scroll)/.test(win.getComputedStyle(scroller).overflowY))) scroller = scroller.parentElement;
+  // 开始拖时每行中线的位置（视口坐标）；滚动了多少另算
+  const mids = rows.map((r) => {
+    const b = r.getBoundingClientRect();
+    return b.top + b.height / 2;
+  });
+  const startY = ev.clientY;
+  const startScroll = scroller?.scrollTop ?? 0;
+  const h = row.getBoundingClientRect().height;
+  let to = from;
+  let lastY = ev.clientY;
+  let raf = 0;
+  row.addClass("is-dragging");
+  for (const r of rows) if (r !== row) r.addClass("is-drag-sibling");
+  const place = () => {
+    const ds = (scroller?.scrollTop ?? 0) - startScroll;
+    // 拖着的这一行跟着指针（滚动时内容往上走，它要补回来）
+    row.setCssStyles({ transform: `translateY(${lastY - startY + ds}px)` });
+    const mid = mids[from] + lastY - startY;
+    // 新位置 = 别的行里中线在它上面的有几行
+    to = mids.filter((m, j) => j !== from && m - ds < mid).length;
+    rows.forEach((r, j) => {
+      if (j === from) return;
+      const shift = from < to && j > from && j <= to ? -h : to < from && j >= to && j < from ? h : 0;
+      r.setCssStyles({ transform: shift ? `translateY(${shift}px)` : "" });
+    });
+  };
+  const tick = () => {
+    raf = 0;
+    if (!scroller) return;
+    const b = scroller.getBoundingClientRect();
+    const edge = 40;
+    const v = lastY < b.top + edge ? -(b.top + edge - lastY) / 3 : lastY > b.bottom - edge ? (lastY - (b.bottom - edge)) / 3 : 0;
+    if (!v) return;
+    scroller.scrollTop += v;
+    place();
+    raf = win.requestAnimationFrame(tick);
+  };
+  const move = (e: PointerEvent) => {
+    lastY = e.clientY;
+    place();
+    if (!raf) raf = win.requestAnimationFrame(tick);
+  };
+  const end = () => {
+    grip.removeEventListener("pointermove", move);
+    grip.removeEventListener("pointerup", end);
+    grip.removeEventListener("pointercancel", end);
+    if (raf) win.cancelAnimationFrame(raf);
+    for (const r of rows) {
+      r.setCssStyles({ transform: "" });
+      r.removeClass("is-dragging", "is-drag-sibling");
+    }
+    // 交出去的是 id：拖到的位置上原来是哪一项
+    if (to !== from) done(rows[from].dataset.mmId ?? "", rows[to].dataset.mmId ?? "");
+  };
+  grip.addEventListener("pointermove", move);
+  grip.addEventListener("pointerup", end);
+  grip.addEventListener("pointercancel", end);
+}

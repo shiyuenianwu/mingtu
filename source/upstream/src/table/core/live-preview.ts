@@ -1,0 +1,268 @@
+/**
+ * 编辑框里的「实时预览」：算出文字里哪些段落带格式、两头的标记符在哪。
+ * 规则直接用节点渲染的 TOKEN_RE，编辑时看到的效果和提交后渲染出来的一致；只认会改变文字外观的几种，
+ * 链接、公式、图片、标签这些在编辑时照旧显示源码。不碰 DOM，方便单测。
+ */
+
+import { highlightColor, type HighlightColor } from "./format";
+import { TOKEN_RE } from "./tokens";
+
+export type SpanKind = "strong" | "em" | "mark" | "del" | "code" | "color" | "bg" | "u";
+
+export interface FormatSpan {
+  kind: SpanKind;
+  /** 整段（含两头的标记符） */
+  from: number;
+  to: number;
+  /** 中间的文字 */
+  innerFrom: number;
+  innerTo: number;
+  /** 文字颜色 / 荧光笔的颜色 */
+  color?: string;
+  /** ==🔴文字== 的高亮颜色（emoji 算在开头的标记符里） */
+  highlight?: HighlightColor;
+  /** 标记是 HTML 标签（颜色、<mark>、<u>）：很长，露出来会把排版整个挤开，编辑时始终藏着 */
+  html?: boolean;
+}
+
+/** TOKEN_RE 里带格式的分组：分组号 → 种类、收尾标记的长度、里面能不能再套格式 */
+const GROUPS: { group: number; kind: SpanKind; close: number; nested: boolean; colorGroup?: number; html?: boolean }[] = [
+  { group: 10, kind: "strong", close: 2, nested: true },
+  { group: 11, kind: "strong", close: 2, nested: true },
+  { group: 12, kind: "code", close: 1, nested: false },
+  { group: 13, kind: "del", close: 2, nested: true },
+  { group: 14, kind: "mark", close: 2, nested: true },
+  { group: 15, kind: "em", close: 1, nested: true },
+  { group: 16, kind: "em", close: 1, nested: true },
+  { group: 22, kind: "color", close: "</span>".length, nested: true, colorGroup: 21, html: true },
+  { group: 24, kind: "bg", close: "</mark>".length, nested: true, colorGroup: 23, html: true },
+  { group: 25, kind: "mark", close: "</mark>".length, nested: true, html: true },
+  { group: 26, kind: "u", close: "</u>".length, nested: true, html: true },
+];
+
+/** 编辑框文字（换行是 \n）里所有带格式的段落，外层在前 */
+export function formatSpans(text: string): FormatSpan[] {
+  const out: FormatSpan[] = [];
+  let offset = 0;
+  for (const line of text.split("\n")) {
+    scan(line, offset, out);
+    offset += line.length + 1;
+  }
+  // HTML 标签的颜色 / 荧光笔可以跨行（<span style="color:…">甲<br>乙</span>，表格格子里的 <br> 在编辑框里是换行）：
+  // 逐行认不出来，标签就露成源码。把换行当成普通字符再找一遍，只补跨行的这几种；里面的格式逐行已经认过了
+  if (text.includes("\n")) {
+    const flat = text.replace(/\n/g, "\u0000");
+    for (const m of flat.matchAll(TOKEN_RE)) {
+      const g = GROUPS.find((x) => m[x.group] !== undefined);
+      if (!g?.html || !m[0].includes("\u0000")) continue;
+      const from = m.index ?? 0;
+      const to = from + m[0].length;
+      const innerTo = to - g.close;
+      out.push({ kind: g.kind, from, to, innerFrom: innerTo - m[g.group].length, innerTo, ...(g.colorGroup ? { color: m[g.colorGroup] } : {}), html: true });
+    }
+    out.sort((x, y) => x.from - y.from || y.to - x.to);
+  }
+  return out;
+}
+
+function scan(text: string, offset: number, out: FormatSpan[]): void {
+  for (const m of text.matchAll(TOKEN_RE)) {
+    const g = GROUPS.find((x) => m[x.group] !== undefined);
+    if (!g) continue;
+    const hc = g.group === 14 ? highlightColor(m[g.group]) : null;
+    const inner = hc ? m[g.group].slice(hc.length) : m[g.group];
+    const from = offset + (m.index ?? 0);
+    const to = from + m[0].length;
+    const innerTo = to - g.close;
+    const innerFrom = innerTo - inner.length;
+    out.push({
+      kind: g.kind,
+      from,
+      to,
+      innerFrom,
+      innerTo,
+      ...(g.colorGroup ? { color: m[g.colorGroup] } : {}),
+      ...(hc ? { highlight: hc.color } : {}),
+      ...(g.html ? { html: true } : {}),
+    });
+    if (g.nested) scan(inner, innerFrom, out);
+  }
+}
+
+/**
+ * 要不要露出这一段的源码。HTML 标签（颜色、<mark>）始终藏着。Markdown 标记（** == ~~ ` *）在光标或选区的
+ * 一头落在这一段里（含紧贴两头）时露出，从点进去到拖选一直露着，不会忽开忽收；
+ * 选区把整段都包进去（比如进入编辑时的全选）时不露，看到的仍是效果
+ */
+export function revealed(span: FormatSpan, ranges: readonly { from: number; to: number }[]): boolean {
+  if (span.html) return false;
+  const inside = (p: number) => p >= span.from && p <= span.to;
+  return ranges.some((r) => (r.from === r.to ? inside(r.from) : !(r.from <= span.from && r.to >= span.to) && (inside(r.from) || inside(r.to))));
+}
+
+/** 编辑框里的一处改动：把 [from, to) 换成 insert */
+export interface TextEdit {
+  from: number;
+  to: number;
+  insert: string;
+}
+
+/**
+ * 删字、打字碰到藏着的标记符时，改成只动看得见的字，标记符保持成对。
+ * 藏着的标记是原子范围，在彩色字后面按退格，编辑器会把整个 </span> 删掉，留下没收尾的 <span>；
+ * 选区从段里拖到段外再删或打字也一样。这里把改动里属于标记符的部分让出来：
+ * - 整段都在改动范围里的照常删；
+ * - 删的全是标记符（退格、Delete 正好落在标记上）时，改成删标记旁边那个看得见的字；
+ * - 只删字时里面的字删光了，两头的标记也一起删，不留空的 ** 或空标签；打字替换时字留在原来的格式里。
+ * backward：退格是 true、Delete 是 false、别的（删选区、打字）是 null。
+ * nextBreak / prevBreak 给出一个字（含组合表情）的边界。不用改时返回 null
+ */
+export function guardHiddenMarks(
+  text: string,
+  hidden: readonly FormatSpan[],
+  edits: readonly TextEdit[],
+  backward: boolean | null,
+  prevBreak: (pos: number) => number,
+  nextBreak: (pos: number) => number,
+): TextEdit[] | null {
+  const marks = (s: FormatSpan): [number, number][] => [
+    [s.from, s.innerFrom],
+    [s.innerTo, s.to],
+  ];
+  const hits = (a: number, b: number) => hidden.some((s) => marks(s).some(([x, y]) => y > x && a < y && x < b && !(a <= s.from && b >= s.to)));
+  // 只删字（不打字）把某段里面的字删光了：标记也得删
+  const empties = (e: TextEdit) =>
+    !e.insert && hidden.some((s) => s.innerTo > s.innerFrom && e.from <= s.innerFrom && e.to >= s.innerTo && !(e.from <= s.from && e.to >= s.to));
+  const needs = (e: TextEdit) => e.to > e.from && (hits(e.from, e.to) || empties(e));
+  if (!edits.some(needs)) return null;
+  const covered = (pieces: [number, number][], a: number, b: number) => {
+    let p = a;
+    for (const [x, y] of pieces) if (x <= p && y > p) p = y;
+    return p >= b;
+  };
+  const merge = (pieces: [number, number][]) => {
+    pieces.sort((x, y) => x[0] - y[0]);
+    const out: [number, number][] = [];
+    for (const [a, b] of pieces) {
+      const last = out[out.length - 1];
+      if (last && a <= last[1]) last[1] = Math.max(last[1], b);
+      else if (b > a) out.push([a, b]);
+    }
+    return out;
+  };
+  const out: TextEdit[] = [];
+  for (const e of edits) {
+    if (!needs(e)) {
+      out.push(e);
+      continue;
+    }
+    // 整段落在改动里的，它的标记照删；只碰到一头的，标记让出来
+    const keep = hidden.filter((s) => !(e.from <= s.from && e.to >= s.to)).flatMap(marks);
+    let pieces: [number, number][] = [[e.from, e.to]];
+    for (const [x, y] of keep) {
+      if (y <= x) continue;
+      pieces = pieces.flatMap(([a, b]): [number, number][] =>
+        b <= x || a >= y
+          ? [[a, b]]
+          : ([
+              [a, x],
+              [y, b],
+            ] as [number, number][]).filter(([p, q]) => q > p),
+      );
+    }
+    if (!pieces.length && !e.insert && backward !== null) {
+      // 删的全是看不见的标记：跳过紧挨着的标记，删旁边那个字
+      const all = hidden.flatMap(marks).filter(([x, y]) => y > x);
+      if (backward) {
+        let p = e.from;
+        for (let m = all.find(([, y]) => y === p); m; m = all.find(([, y]) => y === p)) p = m[0];
+        if (p > 0) pieces = [[prevBreak(p), p]];
+      } else {
+        let p = e.to;
+        for (let m = all.find(([x]) => x === p); m; m = all.find(([x]) => x === p)) p = m[1];
+        if (p < text.length) pieces = [[p, nextBreak(p)]];
+      }
+    }
+    // 里面的字删光了：两头的标记一起删（外层的也可能跟着空掉，所以反复看）。打字替换时不删，字落在原来的格式里
+    for (let grew = !e.insert; grew; ) {
+      grew = false;
+      pieces = merge(pieces);
+      for (const s of hidden) {
+        if (covered(pieces, s.from, s.to)) continue;
+        if (s.innerTo > s.innerFrom && covered(pieces, s.innerFrom, s.innerTo)) {
+          pieces.push([s.from, s.to]);
+          grew = true;
+        }
+      }
+    }
+    pieces = merge(pieces);
+    if (!pieces.length) {
+      if (e.insert) out.push({ from: e.from, to: e.from, insert: e.insert });
+      continue;
+    }
+    pieces.forEach(([a, b], i) => out.push({ from: a, to: b, insert: i === 0 ? e.insert : "" }));
+  }
+  return out;
+}
+
+/**
+ * 复制、剪切选中的一段：格式标签补完整。编辑时标签是藏着的，选中颜色里的一段，选区常常带上了开头的标签、没带结尾的，
+ * 直接复制出来是半截 <span …>，粘到别处显示成源码。这里：选区开头落在格式里面就补上开头的标记，结尾落在里面就补上收尾的，
+ * 选区边缘切在标记符中间时挪到整个标记符外面
+ */
+export function balancedSlice(text: string, from: number, to: number): string {
+  if (from >= to) return "";
+  const spans = formatSpans(text);
+  for (const s of spans) {
+    // 选区边缘切在标记符中间：开头的标记要么整个带上要么整个不带
+    if (from > s.from && from < s.innerFrom) from = s.from;
+    if (from > s.innerTo && from < s.to) from = s.to;
+    if (to > s.from && to < s.innerFrom) to = s.from;
+    if (to > s.innerTo && to < s.to) to = s.to;
+  }
+  if (from >= to) return "";
+  const pre: FormatSpan[] = [];
+  const post: FormatSpan[] = [];
+  for (const s of spans) {
+    // 选中的文字和这段格式里面的字有交集
+    if (!(from < s.innerTo && to > s.innerFrom)) continue;
+    if (from > s.from) pre.push(s);
+    if (to < s.to) post.push(s);
+  }
+  pre.sort((a, b) => a.from - b.from);
+  post.sort((a, b) => b.from - a.from);
+  return pre.map((s) => text.slice(s.from, s.innerFrom)).join("") + text.slice(from, to) + post.map((s) => text.slice(s.innerTo, s.to)).join("");
+}
+
+/**
+ * 在带格式的文字中间换行：先把还开着的格式收尾，换行，再接上。每一行自己是完整的，
+ * 节点里按 <br> 分行显示、Markdown 里都认得出来。返回要插入的文字
+ */
+export function breakInsideFormats(text: string, pos: number): string {
+  return formatBreak(text, pos).insert;
+}
+
+/**
+ * 换行该插在哪、插什么。光标正好贴着格式的开头（看不见的 <span …> 后面）或结尾（</span> 前面）时，
+ * 把换行挪到标签外面：不然会拆出一个空的 <span …></span>，编辑框里露出 </span>（zhiqiang 反馈）
+ */
+export function formatBreak(text: string, pos: number): { pos: number; insert: string } {
+  const all = formatSpans(text);
+  for (let moved = true; moved; ) {
+    moved = false;
+    for (const s of all) {
+      if (s.innerFrom === s.innerTo) continue;
+      if (pos === s.innerFrom && s.from < pos) {
+        pos = s.from;
+        moved = true;
+      } else if (pos === s.innerTo && s.to > pos) {
+        pos = s.to;
+        moved = true;
+      }
+    }
+  }
+  const spans = all.filter((s) => s.innerFrom < pos && pos < s.innerTo);
+  const outer = [...spans].sort((a, b) => a.from - b.from);
+  const inner = [...spans].sort((a, b) => b.from - a.from);
+  return { pos, insert: inner.map((s) => text.slice(s.innerTo, s.to)).join("") + "\n" + outer.map((s) => text.slice(s.from, s.innerFrom)).join("") };
+}

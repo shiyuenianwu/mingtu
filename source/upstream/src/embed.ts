@@ -1,0 +1,308 @@
+/**
+ * 在别的笔记里用 ![[脑图笔记]] / ![[文件.xmind]] 嵌入一张已有的脑图：显示只读预览，
+ * 点工具栏的「打开」或双击节点打开原文件编辑。
+ *
+ * Obsidian 的嵌入按扩展名分派（app.embedRegistry，非公开 API）：xmind 没人注册，直接注册；
+ * md 是 Obsidian 自己的，包一层，只有 frontmatter 带 mindmap 的笔记才接管，其余照旧交回原来的处理。
+ *
+ * 指向某个节点（![[脑图#时间线]]、![[脑图#^abc123]]）时只显示那个节点和它的子树。
+ * 放进白板（Canvas）的卡片里时铺满卡片，卡片拉多大图就多大。
+ */
+
+import { mergeLayout, nodebarDefault } from "./bar-layout";
+import { App, Component, Platform, TFile } from "obsidian";
+import type MindMapPlugin from "./main";
+import { findSubpathNode, MindMapCanvas } from "./canvas";
+import { frontmatterValue, parseMarkdown, parseNodeColors } from "./markdown";
+import type { MindDoc } from "./model";
+import { embedToolbarLayout, indentString } from "./settings";
+import { edgeFromFrontmatter, isThemeId } from "./theme";
+import { isStructure } from "./layout";
+import { describeLost, parseXmind, sheetImageUrls, xmindSheetToDoc } from "./xmind";
+import type { MindNode } from "./model";
+import { parseColorList } from "./format";
+import { t } from "./i18n";
+
+interface EmbedContext {
+  app: App;
+  containerEl: HTMLElement;
+  sourcePath: string;
+}
+
+type EmbedCreator = (ctx: EmbedContext, file: TFile, subpath: string) => Component;
+
+interface EmbedRegistry {
+  embedByExtension: Record<string, EmbedCreator | undefined>;
+  registerExtension(ext: string, creator: EmbedCreator): void;
+  unregisterExtension(ext: string): void;
+}
+
+export function registerMindMapEmbeds(plugin: MindMapPlugin): void {
+  const registry = (plugin.app as App & { embedRegistry?: EmbedRegistry }).embedRegistry;
+  if (!registry?.registerExtension) return;
+  const create = (ctx: EmbedContext, file: TFile, subpath: string) => new MindMapEmbed(plugin, ctx, file, subpath);
+
+  if (!registry.embedByExtension.xmind) {
+    registry.registerExtension("xmind", create);
+    plugin.register(() => registry.unregisterExtension("xmind"));
+  }
+
+  const original = registry.embedByExtension.md;
+  if (original) {
+    registry.unregisterExtension("md");
+    // 别的插件会拿 file=null 来探测嵌入工厂（#32）：没有文件就交给原来的处理
+    registry.registerExtension("md", (ctx, file, subpath) =>
+      file?.path && plugin.isMindMapFile(file.path) ? create(ctx, file, subpath) : original(ctx, file, subpath),
+    );
+    plugin.register(() => {
+      registry.unregisterExtension("md");
+      registry.registerExtension("md", original);
+    });
+  }
+}
+
+export class MindMapEmbed extends Component {
+  private canvas: MindMapCanvas | null = null;
+  private wrap: HTMLElement | null = null;
+  private lastHeight = 0;
+  /** 嵌入的 .xmind 里的图片做成的 blob: 地址，重读或卸载时释放 */
+  private releaseImages: (() => void) | null = null;
+  private bounds: { w: number; h: number } | null = null;
+
+  constructor(
+    private plugin: MindMapPlugin,
+    private ctx: EmbedContext,
+    private file: TFile,
+    /** 嵌入链接里 # 后面的部分：标题路径或 ^块 id，空串为整张图 */
+    private subpath = "",
+    /** 挂在另一张脑图的节点里（固定大小的只读预览）：铺满预览框，里面的节点再嵌脑图只显示文字（只嵌一层） */
+    private inNode = false,
+  ) {
+    super();
+  }
+
+  /** 回到整张图（节点里的预览点「适应」） */
+  fitView(): void {
+    this.canvas?.fit();
+  }
+
+  /** 放在白板卡片里：卡片多大就铺多大，而不是按图的大小算高度 */
+  private inCanvas(): boolean {
+    return this.inNode || !!this.ctx.containerEl.closest(".canvas-node");
+  }
+
+  onload(): void {
+    this.registerEvent(
+      this.plugin.app.vault.on("modify", (f) => {
+        if (f === this.file) void this.loadFile();
+      }),
+    );
+  }
+
+  onunload(): void {
+    this.releaseImages?.();
+    this.releaseImages = null;
+    this.canvas?.destroy();
+    this.canvas = null;
+    this.wrap?.remove();
+    this.wrap = null;
+  }
+
+  async loadFile(): Promise<void> {
+    const { doc, lost, release } = await this.readDoc();
+    if (!doc) {
+      release?.();
+      return;
+    }
+    const settings = this.plugin.settings;
+    const fm = (k: string) => frontmatterValue(doc.frontmatter, k);
+    const structure = fm("mindmap-structure");
+    const theme = fm("mindmap-theme");
+    if (!this.canvas) {
+      this.ctx.containerEl.addClass("mm-file-embed");
+      const wrap = this.ctx.containerEl.createDiv({ cls: "mm-codeblock" });
+      this.wrap = wrap;
+      this.canvas = new MindMapCanvas(wrap, {
+        structure: isStructure(structure) ? structure : settings.defaultStructure,
+        theme: isThemeId(theme) ? theme : settings.defaultTheme,
+        edge: edgeFromFrontmatter(fm),
+        editable: false,
+        embedded: true,
+        // 节点里的预览激活了才接鼠标，激活后滚轮直接拿来缩放、平移，不用再点一下
+        embedWheelLock: () => !this.inNode && settings.embedWheel !== "always",
+        toolbarPosition: settings.toolbarPosition,
+        wheelZoom: () => settings.wheelAction === "zoom",
+        notePreview: () => settings.notePreview,
+        formatBar: () => settings.formatBar,
+        centerOnSelect: () => settings.centerOnSelect,
+        hideSyntax: () => settings.hideSyntax,
+        widthHandleOnHover: () => settings.widthHandleOnHover,
+        newNodeName: () => settings.newNodeName,
+        autoNumber: () => settings.numberByTyping,
+        copyPlain: () => settings.copyPlain,
+        showNodebar: () => settings.showNodebar,
+        nodebarLayout: () => mergeLayout(settings.nodebarLayout, nodebarDefault(Platform.isMobile)),
+        toolbarLayout: () => embedToolbarLayout(settings),
+        nodeColors: () => parseNodeColors(settings.nodeColors),
+        textColors: () => parseColorList(settings.textColors),
+        menuLayout: () => settings.menuLayout,
+        highlightColors: () => parseColorList(settings.highlightColors, true),
+        colorMemory: this.plugin.colorMemory,
+        marqueeDrag: () => settings.leftDrag === "select",
+        caretAtEnd: () => settings.editCaret === "end",
+        dragToFloat: () => settings.dragToFloat,
+        notesExpanded: () => settings.notesExpanded,
+        noteCardFilter: () => settings.noteCardShow,
+        taskProgress: () => settings.taskProgress,
+        taskProgressPos: () => settings.taskProgressPos,
+        relShape: () => settings.relShape,
+        notePopoverSize: this.plugin.notePopoverSize,
+        // 用户自己缩放了（不是适应画布那一下）：记住这次的缩放，下次打开这张嵌入的图还用它（链接里写了 |80% 的以链接为准）
+        onViewChange: (state) => {
+          if (this.applyingZoom || this.zoomFromLink() !== null) return;
+          // 平移不改缩放：缩放没变的不记（不然一拖就把「适应画布」的缩放当成用户选的记住了）
+          if (Math.abs(state.k - this.shownK) < 0.001) return;
+          this.shownK = state.k;
+          this.rememberZoom(state.k);
+        },
+        host: this.plugin.canvasHost(() => this.ctx.sourcePath, this, undefined, { mapPreview: !this.inNode }),
+        onOpenFile: () => void this.plugin.app.workspace.openLinkText(this.file.path, this.ctx.sourcePath),
+        onLayout: (bounds) => {
+          this.bounds = bounds;
+          // 布局回调可能处在 ResizeObserver 链路里，推到下一帧再改高度
+          this.ctx.containerEl.win.requestAnimationFrame(() => this.resize());
+        },
+      });
+      // 实时预览里嵌入框的宽度会在第一次布局之后才定下来；宽度一变就重算高度、重新适应。
+      // 白板卡片的高度也由用户拖，所以在白板里高度变了也要重新适应
+      let last = "";
+      const ro = new ResizeObserver(() => {
+        const size = this.inCanvas() ? `${wrap.clientWidth}x${wrap.clientHeight}` : String(wrap.clientWidth);
+        if (size === last) return;
+        last = size;
+        this.resize();
+      });
+      ro.observe(wrap);
+      this.register(() => ro.disconnect());
+    }
+    this.canvas.setDoc(doc);
+    // 旧节点用的图片地址要等新图换上之后再释放
+    this.releaseImages?.();
+    this.releaseImages = release ?? null;
+    this.focusSubpath(doc.root);
+    this.wrap?.querySelector(".mm-xmind-lost")?.remove();
+    if (lost) this.wrap?.createDiv({ cls: "mm-xmind-lost", text: lost });
+  }
+
+  /**
+   * 预览框高度：宽图按宽度缩小来适应，高度也按同样的比例算，免得下面空出一大片。
+   * 高度变了要重新适应一次，不然图还按旧尺寸摆着
+   */
+  private resize(): void {
+    const wrap = this.wrap;
+    const b = this.bounds;
+    if (!wrap || !b || !wrap.clientWidth) return;
+    if (this.inCanvas()) {
+      this.ctx.containerEl.addClass("mm-in-canvas");
+      this.canvas?.fit();
+      return;
+    }
+    const k = Math.min(1, Math.max(0.2, (wrap.clientWidth - 96) / Math.max(1, b.w)));
+    const h = Math.min(this.plugin.settings.codeBlockMaxHeight, Math.max(200, Math.round(b.h * k + 96 + this.toolbarRoom())));
+    if (h !== this.lastHeight) {
+      this.lastHeight = h;
+      wrap.setCssStyles({ height: `${h}px` });
+    }
+    this.fitAndZoom();
+  }
+
+  private applyingZoom = false;
+  /** 现在显示的缩放（适应、换缩放之后的） */
+  private shownK = 0;
+
+  /** 适应画布，再换成链接里指定的（![[脑图|80%]]）或上次记住的缩放，以图的中心为准 */
+  private fitAndZoom(): void {
+    const canvas = this.canvas;
+    if (!canvas) return;
+    this.applyingZoom = true;
+    try {
+      canvas.fit();
+      const k = this.zoomFromLink() ?? this.plugin.settings.embedZoom?.[this.zoomKey()];
+      if (k) canvas.zoomBy(k / canvas.getViewState().k);
+    } finally {
+      this.applyingZoom = false;
+      this.shownK = canvas.getViewState().k;
+    }
+  }
+
+  /** 链接里竖线后面写的缩放：![[脑图|80%]] → 0.8；没写或写的不是百分比为 null */
+  private zoomFromLink(): number | null {
+    const el = this.ctx.containerEl;
+    const alt = el.getAttribute("alt") ?? el.closest(".internal-embed")?.getAttribute("alt") ?? "";
+    const m = /^\s*(\d{1,3}(?:\.\d+)?)\s*%\s*$/.exec(alt);
+    if (!m) return null;
+    return Math.max(0.1, Math.min(4, Number(m[1]) / 100));
+  }
+
+  private zoomKey(): string {
+    return `${this.ctx.sourcePath}|${this.file.path}#${this.subpath}`;
+  }
+
+  private zoomSaveTimer: number | null = null;
+
+  private rememberZoom(k: number): void {
+    const s = this.plugin.settings;
+    const key = this.zoomKey();
+    const prev = s.embedZoom?.[key];
+    if (prev !== undefined && Math.abs(prev - k) < 0.001) return;
+    // 平移不算：只在缩放真的变了时记（攒一下再存）
+    if (this.zoomSaveTimer !== null) window.clearTimeout(this.zoomSaveTimer);
+    this.zoomSaveTimer = window.setTimeout(() => {
+      this.zoomSaveTimer = null;
+      const map = { ...(s.embedZoom ?? {}) };
+      delete map[key];
+      map[key] = Math.round(k * 1000) / 1000;
+      const keys = Object.keys(map);
+      for (const old of keys.slice(0, Math.max(0, keys.length - 300))) delete map[old];
+      s.embedZoom = map;
+      this.plugin.saveSettingsSoon();
+    }, 400);
+  }
+
+  /** 工具栏在上下边时，预览框要多出它占的高度，图才不会被挡住 */
+  private toolbarRoom(): number {
+    const bar = this.canvas?.toolbarInsets();
+    return bar ? bar.top + bar.bottom : 0;
+  }
+
+  /** 链接指向某个节点就聚焦到它（见 findSubpathNode）。找不到就显示整张图 */
+  private focusSubpath(root: MindNode): void {
+    const canvas = this.canvas;
+    if (!canvas || !this.subpath) return;
+    const found = findSubpathNode(root, this.subpath);
+    if (!found || found === root || canvas.getFocus() === found) return;
+    canvas.focusOn(found);
+    // 只读预览里不用选中它
+    canvas.select(null);
+  }
+
+  /** release：.xmind 图片的 blob: 地址，换上新图之后再释放 */
+  private async readDoc(): Promise<{ doc: MindDoc | null; lost: string; release?: () => void }> {
+    const settings = this.plugin.settings;
+    const style = { maxHeadingLevel: settings.maxHeadingLevel, indent: indentString(settings.indent) };
+    const vault = this.plugin.app.vault;
+    try {
+      if (this.file.extension === "xmind") {
+        // 多个画布的只显示第一个；要看别的打开文件切换
+        const sheet = (await parseXmind(await vault.readBinary(this.file)))[0];
+        if (!sheet) return { doc: null, lost: "" };
+        const urls = sheetImageUrls(sheet);
+        return { doc: xmindSheetToDoc(sheet, style, urls.link), lost: describeLost(sheet.lost), release: urls.revoke };
+      }
+      return { doc: parseMarkdown(await vault.cachedRead(this.file), { fallbackTitle: this.file.basename, style, ...this.plugin.rootRule() }), lost: "" };
+    } catch (e) {
+      this.ctx.containerEl.setText(t("xmind.readFailed", { name: this.file.name, error: (e as Error).message }));
+      return { doc: null, lost: "" };
+    }
+  }
+}

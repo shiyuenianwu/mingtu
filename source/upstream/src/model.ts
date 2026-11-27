@@ -1,0 +1,1015 @@
+/**
+ * 思维导图的内存模型。Markdown 是唯一数据源，这里只是它的树形视图；
+ * 所有编辑操作先改树，再整棵序列化回 Markdown。
+ */
+
+export type NodeKind = "heading" | "list";
+
+/**
+ * 分支能单独设的结构（混合结构）。左右分布的脑图只给中心主题；鱼骨图不分鱼头朝向，排版时让鱼头朝着父节点
+ */
+export type BranchLayout =
+  | "logic-right"
+  | "org-down"
+  | "tree-right"
+  | "timeline-h"
+  | "timeline-h-alt"
+  | "timeline-v-right"
+  | "timeline-v-left"
+  | "timeline-v-alt"
+  | "fishbone";
+export const BRANCH_LAYOUTS: readonly BranchLayout[] = ["logic-right", "org-down", "tree-right", "timeline-h", "timeline-h-alt", "timeline-v-right", "timeline-v-left", "timeline-v-alt", "fishbone"];
+export function isBranchLayout(s: unknown): s is BranchLayout {
+  return (BRANCH_LAYOUTS as readonly unknown[]).includes(s);
+}
+
+export interface MindNode {
+  /** 会话内稳定的 id，重新解析后会变；跨解析请用 pathOf() */
+  id: string;
+  /** 标签的原始行内 Markdown（不含 %% 标记） */
+  text: string;
+  /** 标签下面的备注（原始 Markdown，已去掉首尾空行），无则为空串 */
+  note: string;
+  /** 子节点之后的段落：标题是列表子节点之后、下一个标题之前；列表项是子列表之后、同样缩进的段落 */
+  tail: string;
+  /**
+   * 写在本节点前面、属于父节点那一层的段落：两个列表项之间夹着的文字（「如果用于：」列表「推荐升级为：」列表）。
+   * 跟着位置走，不跟着节点走 —— 节点删掉或挪走时交给下一个兄弟，见 releaseLead
+   */
+  lead: string;
+  /** 列表项那一行末尾有两个以上空格（硬换行，下一行的续写要换行显示）；写回时补在行末 */
+  hardBreak?: boolean;
+  /** 颜色名或 #hex，来自 %%red%% 这类标记 */
+  color?: string;
+  /** 折叠状态，用 %%fold%% 持久化 */
+  folded: boolean;
+  /** 外框：框住本节点及其后 span-1 个兄弟（连同各自的分支），用 %%box%% / %%box=3 "标题"%% 持久化 */
+  box?: Boundary;
+  /** 概要：本节点及其后 span-1 个兄弟外侧画一个大括号，挂一段概括文字；%%summary=3 "文字"%% */
+  summary?: Summary;
+  /** 手动拖出来的节点宽度（px），文字按它换行；用 %%w=240%% 持久化，没有就按内容自适应 */
+  width?: number;
+  /** 思维导图结构里主主题固定在哪一边；%%left%% / %%right%%，没有就按数量自动分 */
+  side?: "left" | "right";
+  /**
+   * 这个分支自己的结构（混合结构）：子节点按它排，不跟随上级；%%layout=fishbone%%。
+   * 没有就跟随上级。中心主题的结构在 frontmatter（mindmap-structure），不用这个
+   */
+  layout?: BranchLayout;
+  /** 间隔复习：只把这个分支加入复习（%%review%%）。整张图加入写在 frontmatter（mindmap-review），不用这个 */
+  review?: boolean;
+  /** 间隔复习的卡片 id（%%rv=k3j9x2%%）：这个节点生成的卡片按它记排期，改字、挪位置都跟着 */
+  reviewId?: string;
+  /**
+   * 自由主题：中心主题的直接子节点才有效，不和中心主题连线，摆在相对中心主题中心 (x, y) 的位置
+   * （自由主题根节点的中心点）。%%float x=320 y=-80%%
+   */
+  float?: FloatPos;
+  /** 标注：挂在节点上方的一段短文字（可换行），%%callout "文字<br>第二行"%% */
+  callout?: string;
+  /** 标注气泡的填充色：颜色名或 #hex，%%callout "文字" cc=red%% */
+  calloutColor?: string;
+  kind: NodeKind;
+  /** 标题节点的级别 1..6；合成根节点为最小标题级别 - 1 */
+  level: number;
+  /** 列表节点的原始项目符号（"-"、"*"、"1." 等），新节点为空则用文档默认值 */
+  bullet: string;
+  /** Obsidian 块引用 id（列表项末尾的 ^abc123），用于 [[笔记#^id]] */
+  blockId?: string;
+  /** %%hide%%：不在脑图里显示（连同子树），笔记里照旧 */
+  hidden?: boolean;
+  /**
+   * 子节点带编号（1. 2. 3.）：编号是算出来的，不写进节点文字。列表子节点用 Markdown 有序列表存（全是 1. 2. 这种项目符号的
+   * 一组读进来就是编号的）；有标题子节点时在本节点写 %%num%%（标题没有原生编号）
+   */
+  numbered?: boolean;
+  /** %%table%%：备注里的第一张表格画在节点框里（标题下面），能直接点格子编辑；备注的其余部分照旧 */
+  table?: boolean;
+  /** 关联线的终点标识：%%id=r1%%，别的节点用 rel=r1 指过来。只在注释里，改名、挪动都不受影响 */
+  anchor?: string;
+  /** 从这个节点出发的关联线：%%rel=r1 "文字" c=40,-60%%，一个节点可以有好几条 */
+  rels?: Relation[];
+  /**
+   * 隐藏的节点不进 children（画布上的操作都碰不到它们），挂在它前面那个可见的兄弟身上，写回时原位放回；
+   * 排在所有可见兄弟前面的挂在父节点的 hiddenFirst 上。打开「显示隐藏的节点」时不摘，这两个都为空
+   */
+  hiddenAfter?: MindNode[];
+  hiddenFirst?: MindNode[];
+  /**
+   * 概要主题（带子树的概要）的起始节点：概要主题不在 parent.children 里，挂在起始节点的 summary.topic 上，
+   * 写回时放在被括住的最后一个兄弟后面（%%summary-topic=N%%）。parent 仍指向那一层的父节点。见 fixTopics
+   */
+  topicOf?: MindNode;
+  /** 文件里写了 %%summary-topic=N%% 却挂不成概要主题（前面的兄弟不够、起始节点已经有概要……）：当普通节点，标记原样写回 */
+  topicSpan?: number;
+  /** 标题和它的标记行之间原文空了几行（Linter 这类插件加的）；写回时照样空 */
+  markerGap?: number;
+  children: MindNode[];
+  parent: MindNode | null;
+  depth: number;
+}
+
+export const NODE_MIN_WIDTH = 60;
+export const NODE_MAX_WIDTH = 4000;
+
+/** 一条关联线：从所在节点指向 anchor 为 to 的节点 */
+export interface Relation {
+  to: string;
+  /** 线上的文字，行内 Markdown，不能含 " 和 %%；没有就是空串 */
+  label: string;
+  /** 线的弯曲（旧写法，一个控制点）：弧顶相对两个节点中心连线中点的偏移（px）；没拖过就按默认弯法 */
+  c?: { x: number; y: number };
+  /**
+   * 两个控制点（#28，拖过手柄后用它，c 不再用）：c1 相对起点节点中心、c2 相对终点节点中心的偏移（px），
+   * 节点挪动时控制点跟着各自的节点走。%%rel=x c1=40,-60 c2=-40,-60%%
+   */
+  c1?: { x: number; y: number };
+  c2?: { x: number; y: number };
+  /** 线形（#53）：曲线、直线、直角折线；没写就按设置里的默认线形。%%rel=x line=straight%% */
+  shape?: RelShape;
+}
+
+export type RelShape = "curve" | "straight" | "elbow";
+export const REL_SHAPES: RelShape[] = ["curve", "straight", "elbow"];
+
+export interface FloatPos {
+  x: number;
+  y: number;
+}
+
+export interface Boundary {
+  /** 框住的兄弟数，含本节点，至少 1 */
+  span: number;
+  title: string;
+  /** 范围里夹着隐藏的兄弟时，文件里写的原始跨度和摘掉隐藏节点后的跨度；没改过就按原样写回 */
+  raw?: HiddenSpan;
+}
+
+export interface HiddenSpan {
+  span: number;
+  visible: number;
+}
+
+export interface Summary {
+  /** 括住的兄弟数，含本节点，至少 1 */
+  span: number;
+  /**
+   * 概要主题：概要本身是一个节点、下面可以挂子树（XMind 的概要主题）。有它时概要显示的就是这个节点，text、width 不用。
+   * 在 Markdown 里写成被括住的最后一个兄弟后面的一项：「- 注意事项 %%summary-topic=2%%」
+   */
+  topic?: MindNode;
+  /** 同 Boundary.raw */
+  raw?: HiddenSpan;
+  /** 行内 Markdown（链接、加粗……），不能含 " 和 %% */
+  text: string;
+  /** 拖出来的文字框宽度（px），文字按它换行；没有就按内容自适应。%%sw=240%% */
+  width?: number;
+}
+
+export interface DocStyle {
+  /** 列表缩进单位："\t" 或若干空格 */
+  indent: string;
+  /** 新列表节点的项目符号 */
+  bullet: string;
+  /** 标题与其下列表之间是否空一行 */
+  blankBeforeList: boolean;
+  /** 紧跟在上一个节点后面的标题前是否空一行（中心主题后面总是空一行；跟在备注、段落后面的也总是空） */
+  blankBeforeHeading: boolean;
+  /** 深于这个级别的标题节点，新建子节点时改用列表 */
+  maxHeadingLevel: number;
+  /** 这张图只把标题当节点（列表都是标题的备注）：新节点都写成标题，写回时备注里的列表不用包起来 */
+  headingsOnly?: boolean;
+  /** 设置「列表项下的备注写成引用块」：列表项的备注每行前加 > 写回，读的时候去掉一层（quoteListNote / unquoteListNote） */
+  quoteListNotes?: boolean;
+}
+
+export interface MindDoc {
+  root: MindNode;
+  /** 原始 frontmatter（含两行 ---），不含结尾换行；无则空串 */
+  frontmatter: string;
+  /** frontmatter 与 H1 之间的文本（罕见），原样保留 */
+  preamble: string;
+  /** 根节点是否来自文件里的一级标题 */
+  rootFromHeading: boolean;
+  style: DocStyle;
+}
+
+let counter = 0;
+export function newId(): string {
+  counter += 1;
+  return `n${counter}`;
+}
+
+export function createNode(init: Partial<MindNode> & { parent: MindNode | null }): MindNode {
+  const parent = init.parent;
+  const node: MindNode = {
+    id: init.id ?? newId(),
+    text: init.text ?? "",
+    note: init.note ?? "",
+    tail: init.tail ?? "",
+    lead: init.lead ?? "",
+    hardBreak: init.hardBreak,
+    color: init.color,
+    folded: init.folded ?? false,
+    box: init.box,
+    summary: init.summary,
+    width: init.width,
+    side: init.side,
+    layout: init.layout,
+    review: init.review,
+    reviewId: init.reviewId,
+    float: init.float,
+    callout: init.callout,
+    calloutColor: init.callout === undefined ? undefined : init.calloutColor,
+    kind: init.kind ?? "list",
+    level: init.level ?? 0,
+    bullet: init.bullet ?? "",
+    blockId: init.blockId,
+    hidden: init.hidden,
+    table: init.table,
+    numbered: init.numbered,
+    anchor: init.anchor,
+    rels: init.rels,
+    topicSpan: init.topicSpan,
+    children: init.children ?? [],
+    parent,
+    depth: parent ? parent.depth + 1 : 0,
+  };
+  return node;
+}
+
+/** 深度优先遍历（含自身），folded 节点的子树不跳过 */
+export function walk(node: MindNode, fn: (n: MindNode) => void): void {
+  fn(node);
+  for (const c of node.children) walk(c, fn);
+}
+
+/** 连隐藏的节点（hiddenFirst / hiddenAfter 里摘出去的）和概要主题也走到；关联线的端点可能藏着 */
+export function walkAll(node: MindNode, fn: (n: MindNode) => void): void {
+  fn(node);
+  for (const h of node.hiddenFirst ?? []) walkAll(h, fn);
+  for (const c of node.children) {
+    walkAll(c, fn);
+    for (const h of c.hiddenAfter ?? []) walkAll(h, fn);
+  }
+  for (const t of topicsOf(node)) walkAll(t, fn);
+}
+
+// ---------- 概要主题 ----------
+
+/** 这一层（node 的子节点）上挂着的概要主题，按起始节点的顺序 */
+export function topicsOf(node: MindNode): MindNode[] {
+  let out: MindNode[] | null = null;
+  for (const c of node.children) if (c.summary?.topic) (out ??= []).push(c.summary.topic);
+  return out ?? [];
+}
+
+/** 显示中的概要主题：父节点折叠了就没有 */
+export function visibleTopics(node: MindNode): MindNode[] {
+  return node.folded ? [] : topicsOf(node);
+}
+
+/** 是不是挂在某个概要上的概要主题（不在父节点的 children 里） */
+export function isSummaryTopic(node: MindNode): boolean {
+  return !!node.topicOf && node.topicOf.summary?.topic === node;
+}
+
+/** 深度优先遍历整张图：子节点，再加上这一层的概要主题（连同它们的子树）。不含隐藏的节点 */
+export function walkMap(node: MindNode, fn: (n: MindNode) => void): void {
+  fn(node);
+  for (const c of node.children) walkMap(c, fn);
+  for (const t of topicsOf(node)) walkMap(t, fn);
+}
+
+/**
+ * 概要主题跟着起始节点：起始节点挪了位置、换了父节点，或者概要的范围变了以后，
+ * 把概要主题的 parent、topicOf、深度对上，写法（标题 / 列表）跟着被括住的最后一个兄弟
+ */
+export function fixTopics(root: MindNode): void {
+  walkMap(root, (n) => {
+    const t = n.summary?.topic;
+    if (!t) return;
+    const sibs = n.parent?.children ?? [n];
+    const i = Math.max(0, sibs.indexOf(n));
+    const last = sibs[Math.min(sibs.length - 1, i + Math.max(1, n.summary!.span) - 1)] ?? n;
+    t.parent = n.parent;
+    t.topicOf = n;
+    t.float = undefined;
+    t.side = undefined;
+    if (t.kind !== last.kind || t.level !== last.level) {
+      t.kind = last.kind;
+      t.level = last.level;
+    }
+    t.depth = n.depth;
+    walkMap(t, (d) => {
+      if (d !== t) d.depth = d.parent ? d.parent.depth + 1 : 0;
+    });
+  });
+}
+
+/**
+ * 写回用：一组兄弟按文件顺序（连同隐藏的），概要主题插在被括住的最后一个兄弟后面。
+ * 括住的个数按文件里的算（夹着隐藏兄弟时用原始跨度），和解析时一致
+ */
+export function fileChildren(node: MindNode): MindNode[] {
+  const all = allChildren(node);
+  if (!node.children.some((c) => c.summary?.topic)) return all;
+  const after = new Map<number, MindNode[]>();
+  for (const c of node.children) {
+    const t = c.summary?.topic;
+    if (!t) continue;
+    const g = c.summary!;
+    const span = g.raw && g.raw.visible === g.span ? g.raw.span : g.span;
+    const at = Math.min(all.length - 1, all.indexOf(c) + Math.max(1, span) - 1);
+    after.set(at, [...(after.get(at) ?? []), t]);
+  }
+  const out: MindNode[] = [];
+  all.forEach((c, i) => out.push(c, ...(after.get(i) ?? [])));
+  return out;
+}
+
+/** 复制用：可见的兄弟，概要主题插在被括住的最后一个兄弟后面 */
+export function withTopics(list: MindNode[]): MindNode[] {
+  if (!list.some((c) => c.summary?.topic)) return list;
+  const after = new Map<number, MindNode[]>();
+  list.forEach((c, i) => {
+    const t = c.summary?.topic;
+    if (!t) return;
+    const at = Math.min(list.length - 1, i + Math.max(1, c.summary!.span) - 1);
+    after.set(at, [...(after.get(at) ?? []), t]);
+  });
+  const out: MindNode[] = [];
+  list.forEach((c, i) => out.push(c, ...(after.get(i) ?? [])));
+  return out;
+}
+
+/**
+ * 解析完、摘隐藏节点之前：带 %%summary-topic=N%% 的节点挂成它前面 N 个兄弟的概要主题。
+ * 挂不上的（前面没有兄弟、起始节点已有概要、范围落进前面别的概要里、自己是隐藏的、碰到自由主题）
+ * 留在原处当普通节点，topicSpan 记着，写回时标记原样不动
+ */
+export function attachSummaryTopics(node: MindNode): void {
+  const sibs = node.children;
+  for (let i = 0; i < sibs.length; i++) {
+    const c = sibs[i];
+    if (c.topicSpan === undefined || c.hidden || c.float || i === 0) continue;
+    const span = Math.min(c.topicSpan, i);
+    const from = i - span;
+    const start = sibs[from];
+    const members = sibs.slice(from, i);
+    // 起始节点隐藏时概要跟着它被摘走，概要主题会写丢，也不挂
+    if (start.summary || start.hidden || members.some((m) => m.topicSpan !== undefined || m.float)) continue;
+    // 起始节点不能落在前面某个概要的范围里（同一层的概要不重叠，重叠的那个不显示）
+    const covered = sibs.slice(0, from).some((s, j) => s.summary && j + Math.max(1, s.summary.span) > from);
+    if (covered) continue;
+    sibs.splice(i, 1);
+    i--;
+    c.topicSpan = undefined;
+    start.summary = { span, text: "", topic: c };
+    c.topicOf = start;
+  }
+  for (const c of sibs) attachSummaryTopics(c);
+  for (const t of topicsOf(node)) attachSummaryTopics(t);
+}
+
+/** 外框 / 概要的跨度不能超出后面剩下的兄弟（删掉兄弟后收窄）；根节点没有兄弟 */
+export function normalizeBoxes(root: MindNode): void {
+  walkMap(root, (n) => {
+    if (!n.box && !n.summary) return;
+    const siblings = n.parent?.children;
+    const rest = siblings ? siblings.length - siblings.indexOf(n) : 1;
+    if (n.box) n.box.span = Math.max(1, Math.min(n.box.span, rest));
+    if (n.summary) n.summary.span = Math.max(1, Math.min(n.summary.span, rest));
+  });
+}
+
+/**
+ * 一组兄弟里的外框：返回 节点 id → 所属外框的起始节点。
+ * 起始节点落在前一个外框范围里的那个外框忽略（同一层不嵌套，跨层可以）。
+ */
+export function boxGroups(siblings: MindNode[]): Map<string, MindNode> {
+  const out = new Map<string, MindNode>();
+  for (let i = 0; i < siblings.length; i++) {
+    const start = siblings[i];
+    if (!start.box || out.has(start.id)) continue;
+    const end = Math.min(siblings.length, i + Math.max(1, start.box.span));
+    for (let j = i; j < end; j++) out.set(siblings[j].id, start);
+  }
+  return out;
+}
+
+export type GroupKind = "box" | "summary";
+
+/** 节点要离开这一排兄弟（比如变成自由主题）之前：前面兄弟上罩着它的外框 / 概要少括一个，免得范围顺延到别人身上 */
+export function shrinkGroupsAround(node: MindNode): void {
+  const sibs = node.parent?.children;
+  if (!sibs) return;
+  const idx = sibs.indexOf(node);
+  sibs.forEach((s, i) => {
+    if (i >= idx) return;
+    if (s.box && i + s.box.span > idx) s.box.span = Math.max(1, s.box.span - 1);
+    if (s.summary && i + s.summary.span > idx) s.summary.span = Math.max(1, s.summary.span - 1);
+  });
+}
+
+/** 外框 / 概要从起始节点算起括住的兄弟下标 [from, to]（含两端） */
+export function groupRange(start: MindNode, kind: GroupKind): [number, number] {
+  const sibs = start.parent?.children ?? [start];
+  const i = sibs.indexOf(start);
+  const span = Math.max(1, start[kind]?.span ?? 1);
+  return [i, Math.min(sibs.length - 1, i + span - 1)];
+}
+
+/** 外框 / 概要能伸到的兄弟下标范围 [lo, hi]：不越过同一层里同类的其他外框 / 概要 */
+export function groupLimits(start: MindNode, kind: GroupKind): { lo: number; hi: number } {
+  const sibs = start.parent?.children ?? [start];
+  const me = sibs.indexOf(start);
+  let lo = 0;
+  let hi = sibs.length - 1;
+  // 中心主题下的自由主题不在主树里：范围伸不过去，自由主题自己也伸不出去
+  const floatAt = (i: number) => !start.parent?.parent && !!sibs[i]?.float;
+  if (floatAt(me)) return { lo: me, hi: me };
+  for (let i = 0; i < sibs.length; i++) {
+    if (i !== me && floatAt(i)) {
+      if (i < me) lo = Math.max(lo, i + 1);
+      else hi = Math.min(hi, i - 1);
+      continue;
+    }
+    const g = sibs[i][kind];
+    if (!g || i === me) continue;
+    const end = i + Math.max(1, g.span) - 1;
+    if (end < me) lo = Math.max(lo, end + 1);
+    else if (i > me) hi = Math.min(hi, i - 1);
+  }
+  return { lo, hi };
+}
+
+/**
+ * 把 start 上的外框 / 概要改成括住兄弟 [from, to]（含两端，超出同类邻居的部分收回来），
+ * 标题、文字、宽度不变；起点变了标记就挪到新的起始节点上。返回新的起始节点
+ */
+export function setGroupRange(start: MindNode, kind: GroupKind, from: number, to: number): MindNode {
+  const sibs = start.parent?.children;
+  if (!sibs || !start[kind]) return start;
+  const { lo, hi } = groupLimits(start, kind);
+  const a = Math.max(lo, Math.min(from, to));
+  const b = Math.min(hi, Math.max(from, to));
+  if (a > b) return start;
+  const next = sibs[a];
+  const span = b - a + 1;
+  if (kind === "box") {
+    const g = start.box!;
+    start.box = undefined;
+    next.box = { ...g, span };
+  } else {
+    const g = start.summary!;
+    start.summary = undefined;
+    next.summary = { ...g, span };
+  }
+  return next;
+}
+
+/**
+ * 插入父节点（XMind 的 ⌘↵）：选中的节点按父节点分组，同一组放进一个新建的空节点里，
+ * 新节点占组里第一个节点的位置；不是兄弟的各自一组。中心主题跳过。
+ * 这一层的外框 / 概要按「被收进去的节点换成新节点」重算范围。返回新建的父节点
+ */
+export function insertParents(nodes: MindNode[], style: DocStyle): MindNode[] {
+  const groups = new Map<MindNode, MindNode[]>();
+  for (const n of nodes) {
+    if (!n.parent) continue;
+    const arr = groups.get(n.parent) ?? [];
+    if (!arr.includes(n)) arr.push(n);
+    groups.set(n.parent, arr);
+  }
+  const created: MindNode[] = [];
+  for (const [parent, members] of groups) {
+    const sibs = parent.children;
+    members.sort((a, b) => sibs.indexOf(a) - sibs.indexOf(b));
+    // 先摘下这一层的外框 / 概要，记住各自罩着哪些节点，挪完再按新位置放回去
+    const saved: { kind: GroupKind; start: MindNode; covered: MindNode[] }[] = [];
+    sibs.forEach((s, i) => {
+      for (const kind of ["box", "summary"] as const) {
+        const g = s[kind];
+        if (g) saved.push({ kind, start: s, covered: sibs.slice(i, i + Math.max(1, g.span)) });
+      }
+    });
+    const data = new Map(saved.map((g) => [g, g.start[g.kind]!]));
+    for (const g of saved) g.start[g.kind] = undefined;
+    const first = members[0];
+    const wrap = createNode({ parent, text: "", kind: first.kind, level: first.level, bullet: first.bullet });
+    wrap.depth = parent.depth + 1;
+    if (first.side) wrap.side = first.side;
+    // 给自由主题加父节点：新节点接替它当自由主题，留在原来的位置
+    if (first.float && !parent.parent) wrap.float = { ...first.float };
+    sibs.splice(sibs.indexOf(first), 0, wrap);
+    members.forEach((m, i) => moveNode(m, wrap, i, style));
+    for (const m of members) m.side = undefined;
+    const inside = new Set(members);
+    for (const g of saved) {
+      const idx = g.covered.map((n) => sibs.indexOf(inside.has(n) ? wrap : n)).filter((i) => i >= 0);
+      if (!idx.length) continue;
+      const lo = Math.min(...idx);
+      const hi = Math.max(...idx);
+      const start = sibs[lo];
+      const prev = start[g.kind];
+      const span = Math.max(hi - lo + 1, prev?.span ?? 0);
+      if (g.kind === "box") start.box = { ...(data.get(g) as Boundary), ...(prev as Boundary | undefined), span };
+      else start.summary = { ...(data.get(g) as Summary), ...(prev as Summary | undefined), span };
+    }
+    created.push(wrap);
+  }
+  return created;
+}
+
+/** 同 boxGroups，换成概要：节点 id → 所属概要的起始节点 */
+export function summaryGroups(siblings: MindNode[]): Map<string, MindNode> {
+  const out = new Map<string, MindNode>();
+  for (let i = 0; i < siblings.length; i++) {
+    const start = siblings[i];
+    if (!start.summary || out.has(start.id)) continue;
+    const end = Math.min(siblings.length, i + Math.max(1, start.summary.span));
+    for (let j = i; j < end; j++) out.set(siblings[j].id, start);
+  }
+  return out;
+}
+
+export function visibleChildren(node: MindNode): MindNode[] {
+  return node.folded ? [] : node.children;
+}
+
+/** 跨解析稳定的定位键：子节点下标路径，如 "0/2/1"；根为 "" */
+export function pathOf(node: MindNode): string {
+  const parts: string[] = [];
+  let cur = node;
+  while (cur.parent) {
+    const i = cur.parent.children.indexOf(cur);
+    // 概要主题不在 children 里：写成 s 加起始节点的下标，如 "0/2/s1"
+    parts.unshift(i < 0 && cur.topicOf ? `s${cur.parent.children.indexOf(cur.topicOf)}` : String(i));
+    cur = cur.parent;
+  }
+  return parts.join("/");
+}
+
+export function findByPath(root: MindNode, path: string): MindNode | null {
+  if (path === "") return root;
+  let cur: MindNode | undefined = root;
+  for (const p of path.split("/")) {
+    cur = p.startsWith("s") ? cur?.children[Number(p.slice(1))]?.summary?.topic : cur?.children[Number(p)];
+    if (!cur) return null;
+  }
+  return cur;
+}
+
+export function findById(root: MindNode, id: string): MindNode | null {
+  let found: MindNode | null = null;
+  walkMap(root, (n) => {
+    if (n.id === id) found = n;
+  });
+  return found;
+}
+
+export function countDescendants(node: MindNode): number {
+  let n = 0;
+  walk(node, () => n++);
+  return n - 1;
+}
+
+export function isAncestor(maybeAncestor: MindNode, node: MindNode): boolean {
+  let cur = node.parent;
+  while (cur) {
+    if (cur === maybeAncestor) return true;
+    cur = cur.parent;
+  }
+  return false;
+}
+
+function refreshDepth(node: MindNode): void {
+  walkMap(node, (n) => {
+    n.depth = n.parent ? n.parent.depth + 1 : 0;
+  });
+}
+
+/** 新节点应当以标题还是列表写回：先跟随兄弟，否则看父节点能否再降一级标题 */
+export function kindForNewChild(parent: MindNode, style: DocStyle): { kind: NodeKind; level: number } {
+  const sibling = parent.children[0];
+  if (sibling) return { kind: sibling.kind, level: sibling.level };
+  if (parent.kind === "heading" && parent.level + 1 <= Math.min(6, style.maxHeadingLevel)) {
+    return { kind: "heading", level: parent.level + 1 };
+  }
+  return { kind: "list", level: 0 };
+}
+
+export function addChild(parent: MindNode, style: DocStyle, text = "", index?: number): MindNode {
+  const { kind, level } = kindForNewChild(parent, style);
+  const node = createNode({ parent, text, kind, level });
+  const at = index === undefined ? parent.children.length : Math.max(0, Math.min(index, parent.children.length));
+  parent.children.splice(at, 0, node);
+  return node;
+}
+
+/**
+ * 中心主题是笔记里唯一的一级标题时，给它加一个同级（#27）：它降成第一级分支，中心主题换成 title（文件名），
+ * 新的一级标题排在它前面或后面。有自由主题（只能挂在中心主题下）时做不了，返回 null
+ */
+export function addRootSibling(doc: MindDoc, title: string, after = true): MindNode | null {
+  const old = doc.root;
+  if (!doc.rootFromHeading || old.children.some((c) => c.float)) return null;
+  const root = createNode({ parent: null, kind: "heading", level: 0, text: title });
+  old.parent = root;
+  old.level = 1;
+  const sibling = createNode({ parent: root, kind: "heading", level: 1 });
+  root.children = after ? [old, sibling] : [sibling, old];
+  walkMap(old, (d) => {
+    d.depth = d.parent ? d.parent.depth + 1 : 0;
+  });
+  doc.root = root;
+  doc.rootFromHeading = false;
+  return sibling;
+}
+
+export function addSibling(node: MindNode, text = "", after = true): MindNode | null {
+  const parent = node.parent;
+  // 概要主题不在兄弟里，没有「前后」
+  if (!parent || isSummaryTopic(node)) return null;
+  const idx = parent.children.indexOf(node);
+  const sibling = createNode({ parent, text, kind: node.kind, level: node.level, bullet: node.bullet });
+  parent.children.splice(after ? idx + 1 : idx, 0, sibling);
+  return sibling;
+}
+
+/**
+ * 节点要离开原来的位置（删除、移走）：它前面那段属于父节点的文字留在原处，
+ * 交给接替这个位置的下一个列表兄弟；后面没有列表兄弟就并进父节点的 tail（写回时还在同一个地方）
+ */
+function releaseLead(node: MindNode): void {
+  const parent = node.parent;
+  if (!node.lead || !parent) return;
+  const next = parent.children[parent.children.indexOf(node) + 1];
+  const join = (a: string, b: string) => [a, b].filter(Boolean).join("\n\n");
+  if (next && next.kind === "list") next.lead = join(node.lead, next.lead);
+  else parent.tail = join(node.lead, parent.tail);
+  node.lead = "";
+}
+
+/** 节点要离开原来的位置：挂在它后面的隐藏兄弟留在原处，改挂到它前面的兄弟（或父节点）身上 */
+function releaseHidden(node: MindNode): void {
+  const parent = node.parent;
+  const after = node.hiddenAfter;
+  if (!parent || !after?.length) return;
+  node.hiddenAfter = undefined;
+  const prev = parent.children[parent.children.indexOf(node) - 1];
+  if (prev) prev.hiddenAfter = [...(prev.hiddenAfter ?? []), ...after];
+  else parent.hiddenFirst = [...(parent.hiddenFirst ?? []), ...after];
+}
+
+/** 写回用：可见的子节点连同挂着的隐藏节点，按文件里的顺序 */
+export function allChildren(node: MindNode): MindNode[] {
+  if (!node.hiddenFirst?.length && !node.children.some((c) => c.hiddenAfter?.length)) return node.children;
+  const out = [...(node.hiddenFirst ?? [])];
+  for (const c of node.children) out.push(c, ...(c.hiddenAfter ?? []));
+  return out;
+}
+
+/** 隐藏的节点数（含子树里的；摘掉的和显示着的都算），给工具栏按钮判断要不要出现 */
+export function countHidden(root: MindNode): number {
+  let n = 0;
+  const visit = (node: MindNode) => {
+    for (const c of fileChildren(node)) {
+      if (c.hidden) n++;
+      visit(c);
+    }
+  };
+  visit(root);
+  return n;
+}
+
+/**
+ * 把带 %%hide%% 的节点从树里摘出来，挂到前面那个可见兄弟上（见 MindNode.hiddenAfter）。
+ * 外框、概要的跨度按可见的兄弟重算，原始跨度记下来，没改过就原样写回
+ */
+export function stripHidden(node: MindNode, onRemove?: (n: MindNode) => void): void {
+  const all = node.children;
+  if (all.some((c) => c.hidden)) {
+    for (let i = 0; i < all.length; i++) {
+      const c = all[i];
+      if (c.hidden) continue;
+      for (const g of [c.box, c.summary]) {
+        if (!g || g.span <= 1) continue;
+        const visible = all.slice(i, i + g.span).filter((x) => !x.hidden).length;
+        if (visible !== g.span) {
+          g.raw = { span: g.span, visible };
+          g.span = visible;
+        }
+      }
+    }
+    const kept: MindNode[] = [];
+    for (const c of all) {
+      if (!c.hidden) {
+        kept.push(c);
+        continue;
+      }
+      const prev = kept[kept.length - 1];
+      if (prev) prev.hiddenAfter = [...(prev.hiddenAfter ?? []), c];
+      else node.hiddenFirst = [...(node.hiddenFirst ?? []), c];
+      if (onRemove) walk(c, onRemove);
+    }
+    node.children = kept;
+  }
+  for (const c of node.children) stripHidden(c, onRemove);
+  for (const t of topicsOf(node)) stripHidden(t, onRemove);
+}
+
+/** 右键「在脑图中隐藏」：打上 %%hide%%，从树里摘掉（写回时原位放回） */
+export function hideNode(node: MindNode): boolean {
+  const parent = node.parent;
+  if (!parent) return false;
+  const idx = parent.children.indexOf(node);
+  if (idx < 0) return false;
+  passTopic(node);
+  node.hidden = true;
+  const prev = parent.children[idx - 1];
+  const moving = [node, ...(node.hiddenAfter ?? [])];
+  node.hiddenAfter = undefined;
+  if (prev) prev.hiddenAfter = [...(prev.hiddenAfter ?? []), ...moving];
+  else parent.hiddenFirst = [...(parent.hiddenFirst ?? []), ...moving];
+  parent.children.splice(idx, 1);
+  // 罩着它的外框 / 概要少罩一个
+  parent.children.forEach((s, i) => {
+    if (i >= idx) return;
+    for (const g of [s.box, s.summary]) if (g && i + g.span > idx) g.span = Math.max(1, g.span - 1);
+  });
+  return true;
+}
+
+export function removeNode(node: MindNode): boolean {
+  const parent = node.parent;
+  if (!parent) return false;
+  // 删概要主题：这个概要整个去掉（被括住的兄弟不动）
+  if (isSummaryTopic(node)) {
+    node.topicOf!.summary = undefined;
+    node.topicOf = undefined;
+    node.parent = null;
+    return true;
+  }
+  const idx = parent.children.indexOf(node);
+  if (idx < 0) return false;
+  releaseLead(node);
+  releaseHidden(node);
+  passTopic(node);
+  parent.children.splice(idx, 1);
+  node.parent = null;
+  return true;
+}
+
+/**
+ * 概要的起始节点要被删掉：概要主题和它的子树不能跟着丢（用户没选它）。
+ * 范围里后面还有兄弟就交给下一个兄弟接着括；没有了，概要主题就留在原处当普通节点
+ */
+function passTopic(node: MindNode): void {
+  const g = node.summary;
+  const t = g?.topic;
+  if (!g || !t) return;
+  const sibs = node.parent!.children;
+  const idx = sibs.indexOf(node);
+  const next = sibs[idx + 1];
+  node.summary = undefined;
+  if (g.span > 1 && next && !next.summary) {
+    next.summary = { span: g.span - 1, text: "", topic: t };
+    t.topicOf = next;
+    return;
+  }
+  t.topicOf = undefined;
+  sibs.splice(idx + 1, 0, t);
+}
+
+/**
+ * 只删节点本身：子节点按原顺序接到父节点下、它原来的位置。
+ * 前面兄弟的外框 / 概要要是罩着它，改成罩住接上来的这几个。返回接上来的子节点
+ */
+export function removeNodeKeepChildren(node: MindNode, style: DocStyle): MindNode[] {
+  const parent = node.parent;
+  if (!parent) return [];
+  const idx = parent.children.indexOf(node);
+  const kids = [...node.children];
+  const extra = kids.length - 1;
+  // 它自己是概要主题的起始节点：概要交给接上来的第一个子节点，范围连同接上来的几个一起括
+  // （第一个子节点自己已经有概要时交不过去，就走 removeNode 里的 passTopic：概要主题留下当普通节点）
+  const own = node.summary;
+  if (own?.topic && kids.length && !kids[0].summary) {
+    node.summary = undefined;
+    kids[0].summary = { ...own, span: own.span + extra, raw: undefined };
+    own.topic.topicOf = kids[0];
+  }
+  parent.children.forEach((s, i) => {
+    if (i >= idx) return;
+    if (s.box && i + s.box.span > idx) s.box.span = Math.max(1, s.box.span + extra);
+    if (s.summary && i + s.summary.span > idx) s.summary.span = Math.max(1, s.summary.span + extra);
+  });
+  kids.forEach((c, i) => moveNode(c, parent, idx + 1 + i, style));
+  removeNode(node);
+  return kids;
+}
+
+/**
+ * 移动节点到新父节点的 index 位置；禁止移到自己的子树里。
+ * 挪完之后排在它后面、只能升成标题才写得回去的列表兄弟会被升级，记进 promoted（给界面提示用）
+ */
+export function moveNode(node: MindNode, newParent: MindNode, index: number, style: DocStyle, promoted?: MindNode[]): boolean {
+  if (node === newParent || isAncestor(node, newParent) || !node.parent || isSummaryTopic(node)) return false;
+  const oldParent = node.parent;
+  releaseLead(node);
+  releaseHidden(node);
+  const oldIdx = oldParent.children.indexOf(node);
+  oldParent.children.splice(oldIdx, 1);
+  if (oldParent === newParent && index > oldIdx) index -= 1;
+  const at = Math.max(0, Math.min(index, newParent.children.length));
+  newParent.children.splice(at, 0, node);
+  node.parent = newParent;
+  // 从编号组拖到没编号的一组：有序列表的项目符号（2.）换回普通的，不然会把那组列表从中间断开
+  if (oldParent !== newParent && !newParent.numbered && orderedBullet(node.bullet)) node.bullet = "";
+  // 自由主题只能挂在中心主题下；挪到别处就是普通节点了
+  if (newParent.parent) node.float = undefined;
+  settleKind(node, style, promoted);
+  refreshDepth(node);
+  return true;
+}
+
+/**
+ * 同一层里标题只能排在列表后面：写回时列表先写、标题后写（标题会把后面的列表都收进自己名下），
+ * 顺序不对的话存一次就乱了。node 刚放到这里，按位置定它的写法：
+ * - 这一层能写标题，并且它本来就是标题、或者前面已经有标题兄弟：它保持 / 变成标题，
+ *   排在它后面的列表兄弟一起升成同级标题（不把标题降成列表，#10）
+ * - 否则跟着这一层写成列表
+ * 子树里的标题级别在序列化时统一重算
+ */
+function settleKind(node: MindNode, style: DocStyle, promoted?: MindNode[]): void {
+  const parent = node.parent!;
+  const sibs = parent.children;
+  const at = sibs.indexOf(node);
+  const otherHeading = sibs.find((c) => c !== node && c.kind === "heading");
+  const below = kindBelow(parent, style);
+  const headingLevel = otherHeading?.level ?? (below.kind === "heading" ? below.level : 0);
+  const headingBefore = sibs.slice(0, at).some((c) => c.kind === "heading");
+  if (headingLevel && (node.kind === "heading" || headingBefore)) {
+    toHeading(node, headingLevel);
+    for (const c of sibs.slice(at + 1)) {
+      if (c.kind === "heading") continue;
+      toHeading(c, headingLevel);
+      promoted?.push(c);
+    }
+    return;
+  }
+  node.kind = "list";
+  node.level = 0;
+}
+
+/** 列表项改写成标题：属于它的块 ID 并进文字（标题行不单独写 ^id），前置段落交给父节点 */
+function toHeading(node: MindNode, level: number): void {
+  if (node.kind === "list") {
+    if (node.blockId) {
+      node.text = `${node.text} ^${node.blockId}`.trim();
+      node.blockId = undefined;
+    }
+    releaseLead(node);
+    node.hardBreak = false;
+  }
+  node.kind = "heading";
+  node.level = level;
+}
+
+/** 父节点之下应当用什么写法：不看兄弟，只看父节点 */
+function kindBelow(parent: MindNode, style: DocStyle): { kind: NodeKind; level: number } {
+  if (parent.kind === "heading" && parent.level + 1 <= Math.min(6, style.maxHeadingLevel)) {
+    return { kind: "heading", level: parent.level + 1 };
+  }
+  return { kind: "list", level: 0 };
+}
+
+/** 把一棵游离的子树（粘贴、导入得到的）挂到 parent 下，并按新位置重算 kind/level/depth */
+export function attachSubtree(node: MindNode, parent: MindNode, style: DocStyle, index?: number): void {
+  const top = kindForNewChild(parent, style);
+  node.parent = parent;
+  // 粘贴进来的子树不带自由主题的位置（挂在中心主题下也会和原来的叠在一起），也不带原来位置上的前置段落
+  node.float = undefined;
+  node.lead = "";
+  const at = index === undefined ? parent.children.length : Math.max(0, Math.min(index, parent.children.length));
+  parent.children.splice(at, 0, node);
+  node.kind = top.kind;
+  node.level = top.level;
+  node.depth = parent.depth + 1;
+  if (!parent.numbered && orderedBullet(node.bullet)) node.bullet = "";
+  const fix = (n: MindNode) => {
+    const k = kindBelow(n, style);
+    for (const c of n.children) {
+      c.parent = n;
+      c.kind = k.kind;
+      c.level = k.level;
+      c.depth = n.depth + 1;
+      fix(c);
+    }
+  };
+  fix(node);
+}
+
+/** 深拷贝一棵子树（不含 parent 指针的循环），用于历史或测试 */
+export function cloneTree(node: MindNode, parent: MindNode | null = null): MindNode {
+  const copy = createNode({
+    parent,
+    text: node.text,
+    note: node.note,
+    tail: node.tail,
+    lead: node.lead,
+    hardBreak: node.hardBreak,
+    color: node.color,
+    folded: node.folded,
+    box: node.box && { ...node.box },
+    summary: node.summary && { ...node.summary },
+    width: node.width,
+    side: node.side,
+    layout: node.layout,
+    review: node.review,
+    reviewId: node.reviewId,
+    float: node.float && { ...node.float },
+    callout: node.callout,
+    calloutColor: node.calloutColor,
+    kind: node.kind,
+    level: node.level,
+    bullet: node.bullet,
+    blockId: node.blockId,
+    hidden: node.hidden,
+    table: node.table,
+    numbered: node.numbered,
+    anchor: node.anchor,
+    rels: node.rels?.map((r) => ({ ...r, c: r.c && { ...r.c } })),
+    topicSpan: node.topicSpan,
+  });
+  if (node.summary?.topic) {
+    const t = cloneTree(node.summary.topic, parent);
+    t.topicOf = copy;
+    copy.summary!.topic = t;
+  }
+  copy.children = node.children.map((c) => cloneTree(c, copy));
+  if (node.hiddenFirst) copy.hiddenFirst = node.hiddenFirst.map((c) => cloneTree(c, copy));
+  if (node.hiddenAfter) copy.hiddenAfter = node.hiddenAfter.map((c) => cloneTree(c, parent));
+  return copy;
+}
+
+/** 有序列表的项目符号（1. / 1)），返回数字和分隔符 */
+export function orderedBullet(bullet: string): { n: number; delim: string; pad: number } | null {
+  const m = /^(\d{1,9})([.)])$/.exec(bullet);
+  // 补零的写法（01. 02.）记下位数，写回时照着补
+  return m ? { n: Number(m[1]), delim: m[2], pad: m[1].startsWith("0") ? m[1].length : 0 } : null;
+}
+
+/** 节点开头手打的序号：「1. 」「2) 」「3、」 */
+export const TYPED_NUMBER_RE = /^\d{1,3}(?:[.)．]\s+|、\s*)(?=\S)/;
+
+/**
+ * 开编号时去掉这组同级手打的序号：每个都以「数字. 」开头才去，只有几个带数字的多半是正文，不碰。
+ * 返回有没有改
+ */
+export function stripTypedNumbers(parent: MindNode): boolean {
+  const kids = parent.children.filter((c) => !c.topicOf && !c.float);
+  if (!kids.length || !kids.every((c) => TYPED_NUMBER_RE.test(c.text))) return false;
+  for (const c of kids) c.text = c.text.replace(TYPED_NUMBER_RE, "");
+  return true;
+}
+
+/** 编号从几开始：第一个列表子节点是有序列表就用它的数字（Markdown 也是这样），否则从 1 */
+export function numberStart(parent: MindNode): number {
+  const first = fileChildren(parent).find((c) => c.kind === "list");
+  return (first && orderedBullet(first.bullet)?.n) ?? 1;
+}
+
+/** 编号组里节点前面显示的编号（「3.」）；父节点没开编号、概要主题、自由主题返回 null */
+export function numberLabel(node: MindNode): string | null {
+  const p = node.parent;
+  if (!p?.numbered || node.topicOf || node.float) return null;
+  const kids = p.children.filter((c) => !c.topicOf && !c.float);
+  const i = kids.indexOf(node);
+  return i < 0 ? null : `${numberStart(p) + i}.`;
+}
+
+/**
+ * 重新解析后（Markdown 里改了、撤销、外部改动），把新树里没变的节点对上旧树，沿用旧的编号：
+ * 画布按编号复用节点的 DOM，只有真正改了的节点重建，几千个节点的笔记打字时不用整张重画。
+ * 从根往下一层层对：同一层里种类和文字都一样的按顺序配对，配上的再往下对它的子节点
+ */
+export function adoptIds(prev: MindNode, next: MindNode): void {
+  const key = (n: MindNode) => n.kind + "\u0001" + n.text;
+  const match = (a: MindNode, b: MindNode) => {
+    b.id = a.id;
+    const pool = new Map<string, MindNode[]>();
+    for (const c of fileChildren(a)) {
+      const list = pool.get(key(c));
+      if (list) list.push(c);
+      else pool.set(key(c), [c]);
+    }
+    for (const c of fileChildren(b)) {
+      const old = pool.get(key(c))?.shift();
+      if (old) match(old, c);
+    }
+  };
+  match(prev, next);
+}
